@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use link::DygmaLink;
 use session::Session;
+use theme::{Frame, Rgb};
 
 fn main() -> ExitCode {
     match run() {
@@ -51,16 +52,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut session = Session::open(device)?;
     println!("firmware: {}", session.firmware()?);
     let count = session.led_count();
+    println!("LED count: {count} (reported by the board, not assumed)");
     println!(
-        "LED count: {count} (reported by the board, not assumed)"
+        "baseline: LED mode {} ({}, {}), {} distinct colours",
+        session.baseline().mode.code(),
+        session.baseline().mode.name(),
+        if session.baseline().mode.holds_frames() {
+            "holds frames"
+        } else {
+            "repaints frames"
+        },
+        Rgb::distinct(&session.baseline().theme)
     );
     println!(
-        "baseline: LED mode {} ({}), {} distinct colours",
-        session.baseline().mode,
-        mode_name(session.baseline().mode),
-        distinct(&session.baseline().theme)
+        "switched to static LED mode ({})",
+        session::LedMode::Static.code()
     );
-    println!("switched to static LED mode ({})", session::STATIC_MODE);
 
     // Prove a frame survives. Without this the frame budget below would be a
     // measurement of our own syscalls while an effect painted over all of them.
@@ -92,12 +99,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     // The frame budget.
-    let frame = theme::encode_theme(&theme::uniform(count, args.colour));
+    let frame = Frame::uniform(count, args.colour);
     println!(
         "\nmeasuring {} full frames of {} bytes, fire-and-forget…",
-        args.frames, frame.len() + 1
+        args.frames,
+        frame.byte_len()
     );
-    let result = bench::measure(&mut session, &frame, args.frames, &interrupted)?;
+    let result = session.measure(&frame, args.frames, &interrupted)?;
     if interrupted.load(Ordering::SeqCst) {
         println!("interrupted after {} frames", result.frames);
     }
@@ -106,7 +114,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         result.frames,
         result.elapsed.as_millis()
     );
-    println!("  {:.1} fps, {:.2} ms per frame", result.fps(), result.ms_per_frame());
+    println!(
+        "  {:.1} fps, {:.2} ms per frame",
+        result.fps(),
+        result.ms_per_frame()
+    );
     println!("  {:.0} KiB/s of LED data", result.kib_per_second());
     println!(
         "  {} acknowledgements discarded (the board acks every frame)",
@@ -117,28 +129,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     session.restore()?;
     println!(
         "\nrestored baseline theme and LED mode {} ({})",
-        session.baseline().mode,
-        mode_name(session.baseline().mode)
+        session.baseline().mode.code(),
+        session.baseline().mode.name()
     );
     Ok(())
-}
-
-/// The LED modes this firmware accepts, named for the log.
-fn mode_name(mode: u8) -> &'static str {
-    match mode {
-        0 => "static",
-        1 => "rainbow",
-        2 => "cycle",
-        3 => "stalker",
-        _ => "unknown",
-    }
-}
-
-fn distinct(colors: &[theme::Rgb]) -> usize {
-    let mut unique = colors.to_vec();
-    unique.sort_by_key(|color| (color.r, color.g, color.b));
-    unique.dedup();
-    unique.len()
 }
 
 /// Turns Ctrl-C into a flag so the baseline can be restored before exiting.

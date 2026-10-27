@@ -14,9 +14,12 @@
 //! discarded periodically or the kernel buffer fills and the device stalls.
 //!
 //! `dygma_focus::Focus` hard-codes a five-second read timeout and keeps its port
-//! private, so it cannot peek or discard. It remains the source of device
-//! discovery (USB identity matching) and of the LED-mode vocabulary; the I/O is
-//! done here against `serialport` directly so a non-blocking drain is possible.
+//! private, so it cannot peek or discard. It remains the source of the device
+//! table used to enumerate ports; the I/O is done here against `serialport`
+//! directly so a non-blocking drain is possible.
+//!
+//! Its `LedMode` vocabulary is deliberately *not* used: it names modes 4–6 as
+//! Red/Green/Blue, while firmware v1.0.12-beta rejects anything above 3.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -74,9 +77,13 @@ pub trait Link {
     }
 }
 
-/// USB identifiers the wired Raise reports: keyboard, then bootloader (which
-/// answers no Focus commands, so it is listed only to explain what was seen).
-const RAISE_USB_IDS: [(u16, u16); 2] = [(0x1209, 0x2201), (0x1209, 0x2200)];
+/// The wired Raise's USB identity.
+const RAISE_KEYBOARD: (u16, u16) = (0x1209, 0x2201);
+
+/// The same board in bootloader mode. It answers no Focus commands, so it must
+/// never be selected — writing LED frames to it just times out after five
+/// seconds per command.
+const RAISE_BOOTLOADER: (u16, u16) = (0x1209, 0x2200);
 
 /// Appends the newline the Focus protocol uses to terminate a command.
 fn frame_command(command: &str) -> String {
@@ -142,12 +149,13 @@ impl DygmaLink {
         if let Some(port) = find_by_serial_symlink() {
             return Self::from_port(&port);
         }
-        let looked_for = RAISE_USB_IDS
-            .iter()
-            .map(|(vid, pid)| format!("{vid:04x}:{pid:04x}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(LinkError::NotFound { looked_for })
+        let (vid, pid) = RAISE_KEYBOARD;
+        Err(LinkError::NotFound {
+            looked_for: format!(
+                "{vid:04x}:{pid:04x} (bootloader {:04x}:{:04x} excluded)",
+                RAISE_BOOTLOADER.0, RAISE_BOOTLOADER.1
+            ),
+        })
     }
 
     /// The port this link is talking to, for logging.
@@ -178,24 +186,62 @@ impl DygmaLink {
     }
 }
 
-/// Enumerates serial ports through `dygma_focus`, which matches the Raise's USB
-/// vendor and product IDs.
+/// Enumerates Dygma devices through `dygma_focus` and keeps the wired Raise.
+///
+/// The crate's table also lists the Defy and the Raise 2, so taking the first
+/// entry would aim frames — and a persisted `led.mode` change — at whichever
+/// keyboard enumerated first. The identity must match exactly.
 fn find_by_usb_identity() -> Option<String> {
-    dygma_focus::prelude::Focus::find_all_devices()
-        .ok()?
-        .first()
-        .map(|device| device.serial_port.clone())
+    let devices = dygma_focus::prelude::Focus::find_all_devices().ok()?;
+    devices
+        .into_iter()
+        .filter(|device| {
+            (
+                device.hardware.usb.vendor_id,
+                device.hardware.usb.product_id,
+            ) != RAISE_BOOTLOADER
+        })
+        .find(|device| {
+            (
+                device.hardware.usb.vendor_id,
+                device.hardware.usb.product_id,
+            ) == RAISE_KEYBOARD
+        })
+        .map(|device| device.serial_port)
+}
+
+/// Reads a port's USB vendor and product IDs from sysfs.
+///
+/// Used by the symlink fallback, where the filename carries vendor and product
+/// *names* rather than IDs, so a name match cannot distinguish a Raise from a
+/// Raise 2.
+fn usb_ids_for_port(port: &str) -> Option<(u16, u16)> {
+    let resolved = std::fs::canonicalize(port).ok()?;
+    let tty = resolved.file_name()?.to_string_lossy().into_owned();
+    let mut node = std::fs::canonicalize(format!("/sys/class/tty/{tty}/device")).ok()?;
+    loop {
+        let vendor = std::fs::read_to_string(node.join("idVendor")).ok();
+        let product = std::fs::read_to_string(node.join("idProduct")).ok();
+        if let (Some(vendor), Some(product)) = (vendor, product) {
+            return Some((
+                u16::from_str_radix(vendor.trim(), 16).ok()?,
+                u16::from_str_radix(product.trim(), 16).ok()?,
+            ));
+        }
+        node = node.parent()?.to_path_buf();
+    }
 }
 
 /// Falls back to the stable `/dev/serial/by-id` symlinks, which survive
 /// `/dev/ttyACM*` renumbering when the port enumerator cannot report USB
-/// metadata.
+/// metadata. Each candidate is verified against its sysfs IDs, never its name.
 fn find_by_serial_symlink() -> Option<String> {
     let entries = std::fs::read_dir("/dev/serial/by-id").ok()?;
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.to_ascii_lowercase().contains("dygma") {
-            return Some(entry.path().to_string_lossy().into_owned());
+        let path = entry.path();
+        let candidate = path.to_string_lossy().into_owned();
+        if usb_ids_for_port(&candidate) == Some(RAISE_KEYBOARD) {
+            return Some(candidate);
         }
     }
     None
@@ -226,7 +272,8 @@ impl Link for DygmaLink {
         let mut chunk = [0u8; 4096];
         loop {
             match self.port.read(&mut chunk) {
-                Ok(0) => continue,
+                // A port returning no bytes must not spin past the deadline.
+                Ok(0) => std::thread::sleep(Duration::from_millis(1)),
                 Ok(read) => buffer.extend_from_slice(&chunk[..read]),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(LinkError::Io(error.to_string())),
@@ -280,7 +327,10 @@ mod tests {
     #[test]
     fn strips_the_terminator_from_a_reply() {
         let mut buffer = b"v1.0.12-beta\r\n.\r\n".to_vec();
-        assert_eq!(take_first_reply(&mut buffer).as_deref(), Some("v1.0.12-beta"));
+        assert_eq!(
+            take_first_reply(&mut buffer).as_deref(),
+            Some("v1.0.12-beta")
+        );
         assert!(buffer.is_empty());
     }
 
@@ -295,7 +345,10 @@ mod tests {
         // A frame's ack arrived before the answer to the command we asked.
         let mut buffer = b"\r\n.\r\nv1.0.12-beta\r\n.\r\n".to_vec();
         assert_eq!(take_first_reply(&mut buffer).as_deref(), Some(""));
-        assert_eq!(take_first_reply(&mut buffer).as_deref(), Some("v1.0.12-beta"));
+        assert_eq!(
+            take_first_reply(&mut buffer).as_deref(),
+            Some("v1.0.12-beta")
+        );
         assert_eq!(take_first_reply(&mut buffer), None);
     }
 

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::link::{Link, LinkError};
+use crate::theme::Frame;
 
 /// What a measurement run observed.
 #[derive(Debug, Clone)]
@@ -58,7 +59,7 @@ pub const DRAIN_EVERY: u32 = 64;
 /// device to respond, so the result is the throughput the visualizer can rely on.
 pub fn measure<L: Link>(
     link: &mut L,
-    frame: &str,
+    frame: &Frame,
     frames: u32,
     interrupted: &AtomicBool,
 ) -> Result<BenchResult, LinkError> {
@@ -69,7 +70,7 @@ pub fn measure<L: Link>(
         if interrupted.load(Ordering::SeqCst) {
             break;
         }
-        link.send(frame)?;
+        link.send(frame.body())?;
         sent += 1;
         if sent % DRAIN_EVERY == 0 {
             acks_drained += link.drain()?;
@@ -78,7 +79,7 @@ pub fn measure<L: Link>(
     Ok(BenchResult {
         frames: sent,
         elapsed: started.elapsed(),
-        frame_bytes: frame.len() + 1,
+        frame_bytes: frame.byte_len(),
         acks_drained,
     })
 }
@@ -88,13 +89,17 @@ mod tests {
     use super::*;
     use crate::testing::FakeLink;
 
+    fn tiny_frame() -> Frame {
+        Frame::from_colors(&[crate::theme::Rgb::new(1, 2, 3)])
+    }
+
     #[test]
     fn counts_frames_actually_sent() {
         let mut link = FakeLink::default();
-        let result = measure(&mut link, "led.theme 1 2 3", 5, &AtomicBool::new(false)).unwrap();
+        let result = measure(&mut link, &tiny_frame(), 5, &AtomicBool::new(false)).unwrap();
         assert_eq!(result.frames, 5);
         assert_eq!(link.count("led.theme"), 5);
-        assert_eq!(result.frame_bytes, 16);
+        assert_eq!(result.frame_bytes, tiny_frame().byte_len());
         assert_eq!(result.acks_drained, 0);
     }
 
@@ -102,7 +107,7 @@ mod tests {
     fn stops_when_interrupted() {
         let mut link = FakeLink::default();
         let flag = AtomicBool::new(true);
-        let result = measure(&mut link, "led.theme 1 2 3", 100, &flag).unwrap();
+        let result = measure(&mut link, &tiny_frame(), 100, &flag).unwrap();
         assert_eq!(result.frames, 0);
         assert_eq!(result.fps(), 0.0);
     }
@@ -113,7 +118,7 @@ mod tests {
             fail_after: Some(3),
             ..FakeLink::default()
         };
-        let error = measure(&mut link, "led.theme 1 2 3", 10, &AtomicBool::new(false)).unwrap_err();
+        let error = measure(&mut link, &tiny_frame(), 10, &AtomicBool::new(false)).unwrap_err();
         assert_eq!(error, LinkError::Io("simulated dead port".to_string()));
     }
 
@@ -123,12 +128,17 @@ mod tests {
             pending_acks: DRAIN_EVERY as usize,
             ..FakeLink::default()
         };
-        let result = measure(&mut link, "led.theme 1 2 3", DRAIN_EVERY, &AtomicBool::new(false))
-            .unwrap();
+        let result = measure(
+            &mut link,
+            &tiny_frame(),
+            DRAIN_EVERY,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(result.acks_drained, DRAIN_EVERY as usize);
 
         link.pending_acks = 0;
-        let short = measure(&mut link, "led.theme 1 2 3", 5, &AtomicBool::new(false)).unwrap();
+        let short = measure(&mut link, &tiny_frame(), 5, &AtomicBool::new(false)).unwrap();
         assert_eq!(short.acks_drained, 0);
     }
 

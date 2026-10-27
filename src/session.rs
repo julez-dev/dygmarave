@@ -5,18 +5,66 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::bench::{self, BenchResult};
 use crate::link::{Link, LinkError};
-use crate::theme::{self, Rgb, ThemeError};
-
-/// The only LED mode that leaves a written frame alone.
-///
-/// Modes 1–3 repaint the board on the firmware's own timer — measured on
-/// v1.0.12-beta, a frame written in rainbow mode is replaced within a second.
-pub const STATIC_MODE: u8 = 0;
+use crate::theme::{self, Frame, Rgb, ThemeError};
 
 /// How long to let a fire-and-forget frame land before reading it back. The
 /// write is only guaranteed to have left this machine, not to have been applied.
 const SETTLE: Duration = Duration::from_millis(120);
+
+/// The LED modes firmware v1.0.12-beta accepts.
+///
+/// Measured: only [`LedMode::Static`] leaves a written frame alone. The other
+/// three repaint on the firmware's own timer and erase a frame within a second.
+/// Anything above 3 is rejected by the firmware, which is why `dygma_focus`'s
+/// enum (which names 4–6 as red/green/blue) is not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedMode {
+    Static,
+    Rainbow,
+    Cycle,
+    Stalker,
+    /// A mode this firmware version does not document.
+    Other(u8),
+}
+
+impl LedMode {
+    pub const fn from_code(code: u8) -> Self {
+        match code {
+            0 => LedMode::Static,
+            1 => LedMode::Rainbow,
+            2 => LedMode::Cycle,
+            3 => LedMode::Stalker,
+            other => LedMode::Other(other),
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            LedMode::Static => 0,
+            LedMode::Rainbow => 1,
+            LedMode::Cycle => 2,
+            LedMode::Stalker => 3,
+            LedMode::Other(code) => code,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            LedMode::Static => "static",
+            LedMode::Rainbow => "rainbow",
+            LedMode::Cycle => "cycle",
+            LedMode::Stalker => "stalker",
+            LedMode::Other(_) => "undocumented",
+        }
+    }
+
+    /// Whether a written frame survives in this mode.
+    pub const fn holds_frames(self) -> bool {
+        matches!(self, LedMode::Static)
+    }
+}
 
 #[derive(Debug)]
 pub enum SessionError {
@@ -59,7 +107,7 @@ impl From<ThemeError> for SessionError {
 /// What the board looked like before we touched it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
-    pub mode: u8,
+    pub mode: LedMode,
     pub theme: Vec<Rgb>,
 }
 
@@ -111,7 +159,7 @@ impl HoldReport {
     }
 }
 
-/// An open session that restores the board when [`Session::restore`] is called.
+/// An open session that restores the board when it ends.
 pub struct Session<L: Link> {
     link: L,
     baseline: Baseline,
@@ -125,17 +173,20 @@ impl<L: Link> Session<L> {
     /// the firmware would paint over the first frame within a second.
     pub fn open(mut link: L) -> Result<Self, SessionError> {
         let mode_reply = link.query("led.mode")?;
-        let mode = mode_reply
+        let code = mode_reply
             .trim()
             .parse::<u8>()
             .map_err(|_| SessionError::UnreadableMode(mode_reply.clone()))?;
         let theme = theme::parse_theme_reply(&link.query("led.theme")?)?;
 
-        link.send(&format!("led.mode {STATIC_MODE}"))?;
+        link.send(&format!("led.mode {}", LedMode::Static.code()))?;
 
         Ok(Self {
             link,
-            baseline: Baseline { mode, theme },
+            baseline: Baseline {
+                mode: LedMode::from_code(code),
+                theme,
+            },
             restored: false,
         })
     }
@@ -154,15 +205,20 @@ impl<L: Link> Session<L> {
         Ok(self.link.query("version")?.trim().to_string())
     }
 
+    /// A full frame of one colour, sized to this board.
+    pub fn uniform_frame(&self, color: Rgb) -> Frame {
+        Frame::uniform(self.led_count(), color)
+    }
+
     /// Writes one full frame, refusing a frame that does not match the board.
-    pub fn write_frame(&mut self, colors: &[Rgb]) -> Result<(), SessionError> {
-        if colors.len() != self.led_count() {
+    pub fn write_frame(&mut self, frame: &Frame) -> Result<(), SessionError> {
+        if frame.leds() != self.led_count() {
             return Err(SessionError::FrameSize {
-                wrote: colors.len(),
+                wrote: frame.leds(),
                 board: self.led_count(),
             });
         }
-        self.link.send(&theme::encode_theme(colors))?;
+        self.link.send(frame.body())?;
         Ok(())
     }
 
@@ -173,7 +229,7 @@ impl<L: Link> Session<L> {
         duration: Duration,
         interrupted: &AtomicBool,
     ) -> Result<HoldReport, SessionError> {
-        let frame = theme::uniform(self.led_count(), color);
+        let frame = self.uniform_frame(color);
         self.write_frame(&frame)?;
         sleep_unless_interrupted(SETTLE, interrupted);
         let immediate = theme::parse_theme_reply(&self.link.query("led.theme")?)?;
@@ -188,6 +244,16 @@ impl<L: Link> Session<L> {
         })
     }
 
+    /// Measures how fast this board accepts frames.
+    pub fn measure(
+        &mut self,
+        frame: &Frame,
+        frames: u32,
+        interrupted: &AtomicBool,
+    ) -> Result<BenchResult, LinkError> {
+        bench::measure(&mut self.link, frame, frames, interrupted)
+    }
+
     /// Puts the baseline theme and LED mode back. Safe to call twice.
     pub fn restore(&mut self) -> Result<(), SessionError> {
         if self.restored {
@@ -196,23 +262,25 @@ impl<L: Link> Session<L> {
         // Theme first, then mode: restoring the mode last lets the original
         // effect resume over the original colours rather than our last frame.
         self.link.send(&theme::encode_theme(&self.baseline.theme))?;
-        self.link.send(&format!("led.mode {}", self.baseline.mode))?;
+        self.link
+            .send(&format!("led.mode {}", self.baseline.mode.code()))?;
         self.restored = true;
         Ok(())
     }
 }
 
-impl<L: Link> Link for Session<L> {
-    fn send(&mut self, command: &str) -> Result<(), LinkError> {
-        self.link.send(command)
-    }
-
-    fn query(&mut self, command: &str) -> Result<String, LinkError> {
-        self.link.query(command)
-    }
-
-    fn drain(&mut self) -> Result<usize, LinkError> {
-        self.link.drain()
+impl<L: Link> Drop for Session<L> {
+    /// Best-effort restore on any exit path that did not call [`Session::restore`],
+    /// including an error or a panic later in the run.
+    ///
+    /// A `Drop` cannot report failure, so a port that has already gone away
+    /// leaves the board in the static mode we selected; ticket 08 owns retrying
+    /// there. Leaving it out entirely would mean a mid-run error always left the
+    /// keyboard in our colours, which is the more common failure.
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = self.restore();
+        }
     }
 }
 
@@ -231,7 +299,7 @@ fn sleep_unless_interrupted(total: Duration, interrupted: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::FakeLink;
+    use crate::testing::{FakeLink, SharedLink};
 
     fn baseline_theme(count: usize) -> String {
         theme::encode_theme(&theme::uniform(count, Rgb::new(10, 20, 30)))
@@ -249,10 +317,21 @@ mod tests {
     }
 
     #[test]
+    fn mode_codes_round_trip() {
+        for code in 0..=7u8 {
+            assert_eq!(LedMode::from_code(code).code(), code);
+        }
+        assert_eq!(LedMode::from_code(0), LedMode::Static);
+        assert_eq!(LedMode::from_code(4), LedMode::Other(4));
+        assert!(LedMode::Static.holds_frames());
+        assert!(!LedMode::Rainbow.holds_frames());
+    }
+
+    #[test]
     fn learns_led_count_and_baseline_mode_from_the_board() {
         let mut session = opened(132);
         assert_eq!(session.led_count(), 132);
-        assert_eq!(session.baseline().mode, 1);
+        assert_eq!(session.baseline().mode, LedMode::Rainbow);
         assert_eq!(session.baseline().theme[0], Rgb::new(10, 20, 30));
         assert_eq!(session.firmware().unwrap(), "v1.0.12-beta");
     }
@@ -281,7 +360,7 @@ mod tests {
     fn refuses_a_frame_sized_for_a_different_board() {
         let mut session = opened(132);
         let error = session
-            .write_frame(&theme::uniform(131, Rgb::new(1, 1, 1)))
+            .write_frame(&Frame::uniform(131, Rgb::new(1, 1, 1)))
             .unwrap_err();
         assert!(matches!(
             error,
@@ -302,12 +381,41 @@ mod tests {
     }
 
     #[test]
+    fn an_unfinished_session_puts_the_board_back_when_dropped() {
+        let link =
+            SharedLink::with_replies(&[("led.mode", "1 \r\n"), ("led.theme", &baseline_theme(4))]);
+        let mut session = Session::open(link.clone()).unwrap();
+        session
+            .write_frame(&Frame::uniform(4, Rgb::new(9, 9, 9)))
+            .unwrap();
+        drop(session);
+        let log = link.log();
+        let theme_calls: Vec<&String> = log
+            .iter()
+            .filter(|command| command.starts_with("led.theme "))
+            .collect();
+        assert_eq!(
+            theme_calls.len(),
+            2,
+            "the frame written plus the restored baseline"
+        );
+        assert_eq!(log.last().unwrap(), "led.mode 1");
+    }
+
+    #[test]
     fn drain_reaches_the_underlying_port_through_the_session() {
-        // A default trait method here would silently discard nothing, letting
-        // acknowledgements pile up until the board stalls.
+        // Measuring borrows the session's link directly, so this asserts the
+        // wiring that keeps acknowledgements from piling up.
         let mut session = opened(4);
         session.link.pending_acks = 3;
-        assert_eq!(session.drain().unwrap(), 3);
+        let drained = bench::measure(
+            &mut session.link,
+            &Frame::uniform(4, Rgb::new(1, 1, 1)),
+            bench::DRAIN_EVERY,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(drained.acks_drained, 3);
     }
 
     #[test]
@@ -321,10 +429,8 @@ mod tests {
 
     #[test]
     fn hold_reports_a_static_board_as_static() {
-        let link = FakeLink::with_replies(&[
-            ("led.mode", "1 \r\n"),
-            ("led.theme", &baseline_theme(4)),
-        ]);
+        let link =
+            FakeLink::with_replies(&[("led.mode", "1 \r\n"), ("led.theme", &baseline_theme(4))]);
         let mut session = Session::open(link).unwrap();
         // The fake always answers the baseline, so nothing drifts.
         let report = session

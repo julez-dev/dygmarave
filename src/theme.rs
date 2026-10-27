@@ -21,6 +21,16 @@ impl Rgb {
     }
 }
 
+impl Rgb {
+    /// How many distinct colours a colour list contains.
+    pub fn distinct(colors: &[Rgb]) -> usize {
+        let mut unique = colors.to_vec();
+        unique.sort_by_key(|color| (color.r, color.g, color.b));
+        unique.dedup();
+        unique.len()
+    }
+}
+
 impl fmt::Display for Rgb {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {} {}", self.r, self.g, self.b)
@@ -47,7 +57,10 @@ impl fmt::Display for ThemeError {
                 "the device returned {values} values, which is not a whole number of RGB triplets"
             ),
             ThemeError::BadValue { token } => {
-                write!(f, "the device returned a value that is not a byte: {token:?}")
+                write!(
+                    f,
+                    "the device returned a value that is not a byte: {token:?}"
+                )
             }
         }
     }
@@ -81,7 +94,9 @@ pub fn parse_theme_reply(reply: &str) -> Result<Vec<Rgb>, ThemeError> {
     }
 
     Ok(values
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|rgb| Rgb::new(rgb[0], rgb[1], rgb[2]))
         .collect())
 }
@@ -101,6 +116,46 @@ pub fn encode_theme(colors: &[Rgb]) -> String {
 /// A full frame filled with one colour, sized to the board's LED count.
 pub fn uniform(count: usize, color: Rgb) -> Vec<Rgb> {
     vec![color; count]
+}
+
+/// One encoded `led.theme` command, ready to write.
+///
+/// ADR-0001 forbids anything but `led.theme` in the frame loop, and warns that
+/// the restriction is easy to regress because a smaller EEPROM-backed command
+/// looks like an optimisation. A frame therefore cannot be built out of an
+/// arbitrary string: the only way to obtain one is from colours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    body: String,
+    leds: usize,
+}
+
+impl Frame {
+    pub fn from_colors(colors: &[Rgb]) -> Self {
+        Self {
+            body: encode_theme(colors),
+            leds: colors.len(),
+        }
+    }
+
+    pub fn uniform(count: usize, color: Rgb) -> Self {
+        Self::from_colors(&uniform(count, color))
+    }
+
+    /// The command body, without the framing newline.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// How many LEDs this frame addresses.
+    pub fn leds(&self) -> usize {
+        self.leds
+    }
+
+    /// Bytes on the wire, including the newline the link adds.
+    pub fn byte_len(&self) -> usize {
+        self.body.len() + 1
+    }
 }
 
 #[cfg(test)]
@@ -129,7 +184,10 @@ mod tests {
 
     #[test]
     fn rejects_empty_reply() {
-        assert_eq!(parse_theme_reply("  . \r\n").unwrap_err(), ThemeError::Empty);
+        assert_eq!(
+            parse_theme_reply("  . \r\n").unwrap_err(),
+            ThemeError::Empty
+        );
     }
 
     #[test]
@@ -148,6 +206,19 @@ mod tests {
             encode_theme(&[Rgb::new(1, 2, 3), Rgb::new(255, 0, 10)]),
             "led.theme 1 2 3 255 0 10"
         );
+    }
+
+    #[test]
+    fn a_frame_counts_its_newline_as_wire_bytes() {
+        let frame = Frame::uniform(2, Rgb::new(1, 2, 3));
+        assert_eq!(frame.body(), "led.theme 1 2 3 1 2 3");
+        assert_eq!(frame.byte_len(), frame.body().len() + 1);
+    }
+
+    #[test]
+    fn distinct_counts_unique_colours() {
+        let colors = vec![Rgb::new(1, 1, 1), Rgb::new(1, 1, 1), Rgb::new(2, 2, 2)];
+        assert_eq!(Rgb::distinct(&colors), 2);
     }
 
     #[test]
