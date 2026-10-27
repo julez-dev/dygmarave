@@ -15,6 +15,7 @@ mod bench;
 mod level;
 mod link;
 mod session;
+mod spectrum;
 mod theme;
 
 #[cfg(test)]
@@ -152,8 +153,152 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Captures the output mix and prints a live level meter, so the audio path can
-/// be checked before any DSP exists.
+/// What a probe draws while it runs.
+enum Probe {
+    Level {
+        window: Vec<f32>,
+        held: Vec<f32>,
+        loudest: f32,
+    },
+    Spectrum {
+        analyzer: Box<spectrum::Analyzer>,
+        /// Loudest band seen per channel, and its amplitude.
+        loudest: Vec<(usize, f32)>,
+        amplitude: f32,
+    },
+}
+
+impl Probe {
+    fn new(args: &args::Args, capture: &audio::Capture) -> Self {
+        if args.probe_spectrum {
+            let plan = spectrum::BandPlan::standard(capture.sample_rate, spectrum::FFT_SIZE);
+            println!(
+                "  window: {} samples ({:.1} ms), {} bands {:.0}-{:.0} Hz, log-spaced",
+                plan.fft_size(),
+                plan.fft_size() as f32 * 1000.0 / capture.sample_rate as f32,
+                plan.band_count(),
+                plan.edges()[0],
+                plan.edges()[plan.band_count()]
+            );
+            Probe::Spectrum {
+                analyzer: Box::new(spectrum::Analyzer::new(plan, capture.channels as usize)),
+                loudest: vec![(0, 0.0); capture.channels as usize],
+                amplitude: 0.0,
+            }
+        } else {
+            Probe::Level {
+                window: Vec::new(),
+                held: vec![0.0; capture.channels as usize],
+                loudest: 0.0,
+            }
+        }
+    }
+
+    fn absorb(&mut self, samples: &[f32]) {
+        match self {
+            Probe::Level { window, .. } => window.extend_from_slice(samples),
+            Probe::Spectrum { analyzer, .. } => analyzer.push_interleaved(samples),
+        }
+    }
+
+    /// Draws the current state, updating what has been heard.
+    fn line(&mut self, channels: u16) -> Option<String> {
+        match self {
+            Probe::Level {
+                window,
+                held,
+                loudest,
+            } => {
+                let levels = level::measure(window, channels)?;
+                *loudest = loudest.max(levels.loudest());
+                for (index, peak) in levels.peak.iter().enumerate() {
+                    if let Some(slot) = held.get_mut(index) {
+                        *slot = slot.max(*peak);
+                    }
+                }
+                window.clear();
+                Some(level::meter_line(&levels))
+            }
+            Probe::Spectrum {
+                analyzer,
+                loudest,
+                amplitude,
+            } => {
+                let spectrum = analyzer.spectrum()?;
+                for (channel, slot) in loudest.iter_mut().enumerate() {
+                    let (band, level) = spectrum.loudest_band(channel);
+                    *amplitude = amplitude.max(level);
+                    if level >= slot.1 {
+                        *slot = (band, level);
+                    }
+                }
+                Some(render_bands(&spectrum))
+            }
+        }
+    }
+
+    fn loudest(&self) -> f32 {
+        match self {
+            Probe::Level { loudest, .. } => *loudest,
+            Probe::Spectrum { amplitude, .. } => *amplitude,
+        }
+    }
+
+    fn summary(&self) -> Vec<String> {
+        match self {
+            Probe::Level { held, .. } => held
+                .iter()
+                .enumerate()
+                .map(|(index, peak)| {
+                    format!(
+                        "  channel {} peak: {:.1} dBFS",
+                        index + 1,
+                        level::to_dbfs(*peak)
+                    )
+                })
+                .collect(),
+            Probe::Spectrum {
+                analyzer, loudest, ..
+            } => {
+                let plan = analyzer.plan();
+                loudest
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, level))| *level > 0.0)
+                    .map(|(index, (band, level))| {
+                        format!(
+                            "  channel {} loudest band: {} of {} (~{:.0} Hz, {:.3})",
+                            index + 1,
+                            band,
+                            plan.band_count(),
+                            plan.centre_hz(*band),
+                            level
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// One character per band, so a sweep is visible as a moving peak.
+fn render_bands(spectrum: &spectrum::Spectrum) -> String {
+    (0..spectrum.channel_count())
+        .map(|channel| {
+            spectrum
+                .bands(channel)
+                .iter()
+                .map(|amplitude| level::bar(level::to_dbfs(*amplitude), 1))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+        .trim_end()
+        .to_string()
+}
+
+/// Captures the output mix and prints a live readout, so the audio path can be
+/// checked before any DSP exists.
 fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
     let selection = audio::choose(args.source.as_deref())?;
     println!(
@@ -174,15 +319,13 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
         "  {} channels at {} Hz, {:?}",
         capture.channels, capture.sample_rate, capture.sample_format
     );
+    let mut probe = Probe::new(args, &capture);
     println!("  listening for {} s — play something…", args.seconds);
 
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
-    let mut loudest = 0.0f32;
     let mut blocks = 0u64;
-    let mut held = vec![0.0f32; capture.channels as usize];
-    let mut window: Vec<f32> = Vec::new();
     let mut last_draw = Instant::now();
-    // A live meter redraws in place, but a journal or a pipe gets one line a
+    // A live readout redraws in place, but a journal or a pipe gets one line a
     // second instead of a wall of carriage returns.
     let interactive = std::io::stdout().is_terminal();
     let redraw_every = if interactive {
@@ -195,7 +338,7 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(block) => {
                 blocks += 1;
-                window.extend_from_slice(&block.samples);
+                probe.absorb(&block.samples);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -203,41 +346,30 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
         if last_draw.elapsed() < redraw_every {
             continue;
         }
-        if let Some(levels) = level::measure(&window, capture.channels) {
-            loudest = loudest.max(levels.loudest());
-            for (index, peak) in levels.peak.iter().enumerate() {
-                if let Some(slot) = held.get_mut(index) {
-                    *slot = slot.max(*peak);
-                }
-            }
+        if let Some(line) = probe.line(capture.channels) {
             if interactive {
-                print!("\r{}    ", level::meter_line(&levels));
+                print!("\r{line}    ");
             } else {
-                println!("{}", level::meter_line(&levels));
+                println!("{line}");
             }
             std::io::stdout().flush()?;
         }
-        window.clear();
         last_draw = Instant::now();
+    }
+    // The final window counts too: audio that started just before the deadline
+    // is still audio, and discarding it reported "heard nothing" for a source
+    // that had plainly been heard.
+    if let Some(line) = probe.line(capture.channels) {
+        if !interactive {
+            println!("{line}");
+        }
     }
     if interactive {
         println!();
     }
     let stream_error = capture.take_error();
 
-    // The last window is measured too: audio that started just before the
-    // deadline is still audio, and discarding it reported "heard nothing" for a
-    // source that had plainly been heard.
-    if let Some(levels) = level::measure(&window, capture.channels) {
-        loudest = loudest.max(levels.loudest());
-        for (index, peak) in levels.peak.iter().enumerate() {
-            if let Some(slot) = held.get_mut(index) {
-                *slot = slot.max(*peak);
-            }
-        }
-    }
-
-    if verdict(loudest) == Verdict::Silent {
+    if verdict(probe.loudest()) == Verdict::Silent {
         if let Some(error) = stream_error {
             println!("  stream stopped: {error}");
         }
@@ -247,20 +379,17 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
         }
         .into());
     }
+
     if let Some(error) = stream_error {
         println!("  note: the stream reported an error: {error}");
     }
-    for (index, peak) in held.iter().enumerate() {
-        println!(
-            "  channel {} peak: {:.1} dBFS",
-            index + 1,
-            level::to_dbfs(*peak)
-        );
+    for line in probe.summary() {
+        println!("{line}");
     }
     println!(
         "  captured {} at {:.1} dBFS peak — this is the output mix, not the microphone",
         selection.display_name(),
-        level::to_dbfs(loudest)
+        level::to_dbfs(probe.loudest())
     );
     Ok(())
 }

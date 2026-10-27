@@ -17,6 +17,8 @@ pub struct Args {
     pub frames: u32,
     /// Probe the audio path instead of the LED path.
     pub probe_audio: bool,
+    /// Print band energies instead of a broadband meter.
+    pub probe_spectrum: bool,
     /// How long to probe audio for.
     pub seconds: u64,
     /// Capture device to use instead of choosing one.
@@ -32,6 +34,7 @@ impl Default for Args {
             hold_ms: 3_000,
             frames: 120,
             probe_audio: false,
+            probe_spectrum: false,
             seconds: 5,
             source: None,
             help: false,
@@ -50,12 +53,14 @@ Options:
   --hold-ms <MS>      hold the colour this long before checking it (default 3000)
   --frames <N>        frames to write when measuring (default 120)
   --probe-audio       probe the audio path instead of the LED path
+  --probe-spectrum    probe audio and print 28 log-spaced band energies
   --seconds <N>       how long to probe audio for (default 5)
   --source <ID>       capture this device instead of choosing a monitor
   -h, --help          show this help
 
 With --probe-audio, the default sink's monitor is captured (never the
 microphone) and a live level meter is printed, failing if no signal arrives.
+--probe-spectrum replaces the meter with one character per frequency band.
 
 The board is found by USB identity, not by a fixed port name. The LED count is
 read from the board itself. The baseline theme and LED mode are restored on exit
@@ -90,6 +95,10 @@ where
                 parsed.colour = parse_colour(&value)?;
             }
             "--probe-audio" => parsed.probe_audio = true,
+            "--probe-spectrum" => {
+                parsed.probe_audio = true;
+                parsed.probe_spectrum = true;
+            }
             "--seconds" => {
                 let value = next_value(&mut args, &flag)?;
                 parsed.seconds = value
@@ -190,6 +199,13 @@ mod tests {
         assert!(parsed.probe_audio);
         assert_eq!(parsed.seconds, 2);
         assert_eq!(parsed.source.as_deref(), Some("pipewire:42"));
+    }
+
+    #[test]
+    fn the_spectrum_probe_implies_the_audio_probe() {
+        let parsed = args(&["--probe-spectrum"]).unwrap();
+        assert!(parsed.probe_audio, "spectrum needs audio capture");
+        assert!(parsed.probe_spectrum);
     }
 
     #[test]
