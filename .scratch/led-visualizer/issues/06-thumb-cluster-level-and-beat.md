@@ -22,13 +22,22 @@ THUMB_CLUSTER_LEFT  = [69, 70, 71, 72]
 THUMB_CLUSTER_RIGHT = [128, 129, 130, 131]
 ```
 
-`dygmarave --thumbs` paints the guessed left cluster magenta and the right
-cluster cyan against a dim grey backdrop of the rest of the underglow. A
-photograph of the board while that runs shows both what was guessed and what was
-left out. If the magenta/cyan LEDs are not the physical thumb keys, correct the
-two constants — nothing else changes, because the detection logic takes the
-indices as data.
+**Corrected after a first diagnostic run.** The first guess put the thumbs on
+the underglow (69+). Running it showed all key LEDs dark while only underglow
+lit — which is what the diagnostic did, but the wrong thing: the spec's "4 thumb
+keys" means physical keys in the bottom row, not underglow. The constants are now
+the inner-most bottom-row keys, two per side:
 
-The underglow is 63 LEDs (69–131), and the key map covers 0–68. The four-per-side
-split chosen here leaves 55 LEDs for ambient underglow. A photograph settles the
-real split the same way ticket 04's settled the key map.
+```rust
+THUMB_CLUSTER_LEFT  = [31, 32]   // row 4, columns 6-7
+THUMB_CLUSTER_RIGHT = [68, 67]   // row 4, columns 8-9, mirrored
+```
+
+These are key LEDs but *not* band LEDs: `band_leds` walks the four letter rows
+only, so the thumbs and the spectrum never compete for the same LED.
+
+`dygmarave --thumbs` paints these two clusters magenta (left) and cyan (right) and
+leaves every other key and all underglow dark. A photograph while that runs shows
+exactly which keys the guess lights. If the magenta/cyan keys are not the physical
+thumb keys, correct the two constants — nothing else changes, because the
+detection logic takes the indices as data.

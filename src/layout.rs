@@ -209,15 +209,18 @@ pub fn band_capacity(half: Half) -> usize {
 
 /// LEDs in the left thumb cluster.
 ///
-/// The key map covers 0–68; everything from 69 up is underglow. The thumbs are
-/// the inner-bottom corner of each half's underglow, which is where the physical
-/// thumb keys sit. These indices are structural — the exact mapping needs a
-/// photograph to confirm — but the logic is independent of which indices are
-/// chosen: each half's cluster gets its own channel's level and beat flash.
-pub const THUMB_CLUSTER_LEFT: [u8; 4] = [69, 70, 71, 72];
+/// The thumbs are physical keys in the bottom modifier row, not underglow: the
+/// spec's "4 thumb keys" means two per side. In [`PHYSICAL_MAP`] row 4 the
+/// inner-most left keys are LED 31 (column 6) and LED 32 (column 7). These are
+/// key LEDs but *not* band LEDs — [`band_leds`] walks the four letter rows only,
+/// so the thumbs and the spectrum never compete for the same LED.
+///
+/// The exact indices still want a photograph to confirm; the logic takes them as
+/// data, so correcting them changes nothing else.
+pub const THUMB_CLUSTER_LEFT: [u8; 2] = [31, 32];
 
-/// LEDs in the right thumb cluster.
-pub const THUMB_CLUSTER_RIGHT: [u8; 4] = [128, 129, 130, 131];
+/// LEDs in the right thumb cluster: the inner-most keys of row 4, mirrored.
+pub const THUMB_CLUSTER_RIGHT: [u8; 2] = [68, 67];
 
 /// The LED indices for one half's thumb cluster.
 pub fn thumb_leds(half: Half) -> &'static [u8] {
@@ -230,22 +233,16 @@ pub fn thumb_leds(half: Half) -> &'static [u8] {
 /// A diagnostic pattern for locating the thumb clusters by photograph.
 ///
 /// The thumb indices in [`THUMB_CLUSTER_LEFT`] and [`THUMB_CLUSTER_RIGHT`] are
-/// structural guesses: neither Dygma source records which underglow LEDs are the
-/// physical thumb keys. This paints the guessed left cluster magenta, the guessed
-/// right cluster cyan, and the rest of the underglow dim grey, so a photograph
-/// shows both what was guessed and what was left out. Correct the constants from
-/// the photo; the detection logic does not depend on which indices are chosen.
+/// structural guesses: neither Dygma source records which bottom-row keys are the
+/// physical thumb keys. This paints the guessed left cluster magenta and the
+/// guessed right cluster cyan, and leaves every other key and the underglow dark,
+/// so a photograph shows exactly which keys the guess lights. Correct the
+/// constants from the photo; the detection logic does not depend on them.
 pub fn thumb_pattern(count: usize) -> Vec<Rgb> {
-    const BACKDROP: Rgb = Rgb::new(20, 20, 20);
     const LEFT: Rgb = Rgb::new(255, 0, 255);
     const RIGHT: Rgb = Rgb::new(0, 255, 255);
 
     let mut colors = vec![Rgb::BLACK; count];
-    // A dim backdrop over the whole underglow, so its extent is visible in the
-    // photo even where no thumb is guessed.
-    for slot in colors.iter_mut().skip(69) {
-        *slot = BACKDROP;
-    }
     for led in THUMB_CLUSTER_LEFT {
         if let Some(slot) = colors.get_mut(led as usize) {
             *slot = LEFT;
@@ -644,16 +641,26 @@ mod tests {
     }
 
     #[test]
-    fn thumb_clusters_are_distinct_underglow_leds() {
-        // Each half's cluster must be separate, and must not overlap the key map.
+    fn thumb_clusters_are_bottom_row_keys_outside_the_band_rows() {
+        // The thumbs are physical keys in row 4, not underglow. They must be key
+        // LEDs (so they exist), but must not be band LEDs (so they never compete
+        // with the spectrum for the same LED).
         let key_set: Vec<u8> = key_leds();
+        let band_set: Vec<u8> = [Half::Left, Half::Right]
+            .into_iter()
+            .flat_map(band_leds)
+            .collect();
         for half in [Half::Left, Half::Right] {
             for led in thumb_leds(half) {
+                assert!(key_set.contains(led), "thumb LED {led} must be a key LED");
                 assert!(
-                    !key_set.contains(led),
-                    "thumb LED {led} must not be a key LED"
+                    !band_set.contains(led),
+                    "thumb LED {led} must not be a band LED"
                 );
-                assert!(*led >= 69, "thumb LED {led} must be underglow");
+                assert!(
+                    *led < 69,
+                    "thumb LED {led} must be a key LED, not underglow"
+                );
             }
         }
         // The two clusters must not share LEDs.
@@ -666,22 +673,25 @@ mod tests {
     }
 
     #[test]
-    fn a_thumb_pattern_lights_only_the_guessed_clusters_brightly() {
+    fn a_thumb_pattern_lights_only_the_guessed_clusters() {
         let colors = thumb_pattern(132);
-        // The guessed clusters are the only bright LEDs in the underglow.
         for led in THUMB_CLUSTER_LEFT {
             assert_eq!(colors[led as usize], Rgb::new(255, 0, 255));
         }
         for led in THUMB_CLUSTER_RIGHT {
             assert_eq!(colors[led as usize], Rgb::new(0, 255, 255));
         }
-        // Key LEDs stay dark.
-        for led in key_leds() {
-            assert_eq!(
-                colors[led as usize],
-                Rgb::BLACK,
-                "key LED {led} must be dark"
-            );
+        // Everything else — other keys and all underglow — stays dark.
+        let thumb_set: Vec<u8> = [Half::Left, Half::Right]
+            .into_iter()
+            .flat_map(thumb_leds)
+            .copied()
+            .collect();
+        for (led, colour) in colors.iter().enumerate() {
+            if thumb_set.contains(&(led as u8)) {
+                continue;
+            }
+            assert_eq!(*colour, Rgb::BLACK, "LED {led} must be dark");
         }
     }
 
