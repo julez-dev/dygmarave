@@ -22,6 +22,7 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | LED count | Queried every startup by counting `led.theme` triples; measured 132, of which indices 20 and 131 ignore writes | — |
 | LED mode | Query current mode, switch to a static non-repainting one, restore on exit (mode is EEPROM-persisted) | — |
 | Frame write | Fire-and-forget, no per-frame terminator wait; a periodic health probe catches a dead port | — |
+| Layer-change flash | Accepted, not prevented: the firmware repaints on a layer change and no Focus command can stop it, so the next frame redraws over it (~33 ms at 30 fps) | — |
 | Bands | 28 analysed; a half displays 26 (left) / 27 (right) because that is how many letter keys it has; snake, mirrored, bass at inner edges | ADR-0003 |
 | Audio | System output only, PulseAudio/PipeWire monitor source via `cpal` | — |
 | Analysis | 1024-sample window (≈21 ms at 48 kHz), log-spaced 40 Hz–16 kHz | — |

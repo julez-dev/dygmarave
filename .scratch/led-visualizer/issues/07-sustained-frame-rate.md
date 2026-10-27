@@ -11,3 +11,16 @@
 - [ ] A port that stops accepting writes is detected by the health probe rather than silently dropping frames forever.
 - [ ] When the board cannot sustain the target rate, fps degrades and recovers, and spectral fidelity is never reduced.
 - [ ] The achieved rate is reported so it can be compared against the target.
+
+## Not a reason to raise the frame rate
+
+A layer change repaints the whole board from that layer's colormap, which wipes
+whatever frame was showing. There is no host-side prevention: the Focus API has
+no command to disable the colormap, lock the layer, or freeze the LED buffer, and
+`led.mode` only chooses which effect owns the LEDs (0 is the colormap, 1–3
+repaint continuously, 4+ is rejected by the firmware).
+
+The maintainer chose to **accept the one-frame blink** rather than raise the
+frame rate to shorten it (30 fps → ~33 ms; the measured ceiling of ~70 fps would
+give ~14 ms but cost typing latency and CPU). So this ticket's job is the target
+rate and the adaptive fallback, not chasing the flash.
