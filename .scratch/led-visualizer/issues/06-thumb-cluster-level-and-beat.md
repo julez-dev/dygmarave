@@ -4,7 +4,7 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Each half's thumb cluster reflects its own channel's level, not a shared value.
 - [x] A bass onset produces a brief white flash that returns to the level colour.
@@ -22,11 +22,12 @@ THUMB_CLUSTER_LEFT  = [69, 70, 71, 72]
 THUMB_CLUSTER_RIGHT = [128, 129, 130, 131]
 ```
 
-**Corrected after a first diagnostic run.** The first guess put the thumbs on
-the underglow (69+). Running it showed all key LEDs dark while only underglow
-lit — which is what the diagnostic did, but the wrong thing: the spec's "4 thumb
-keys" means physical keys in the bottom row, not underglow. The constants are now
-the inner-most bottom-row keys, two per side:
+**Verified on hardware.** The first guess put the thumbs on the underglow (69+).
+Running it showed all key LEDs dark while only underglow lit — which is what the
+diagnostic did, but the wrong thing: the spec's "4 thumb keys" means physical keys
+in the bottom row, not underglow. Corrected to the inner-most bottom-row keys and
+**confirmed by the maintainer on the board**: "thumb keys are glowing as
+expected". The constants are:
 
 ```rust
 THUMB_CLUSTER_LEFT  = [31, 32]   // row 4, columns 6-7
@@ -37,7 +38,5 @@ These are key LEDs but *not* band LEDs: `band_leds` walks the four letter rows
 only, so the thumbs and the spectrum never compete for the same LED.
 
 `dygmarave --thumbs` paints these two clusters magenta (left) and cyan (right) and
-leaves every other key and all underglow dark. A photograph while that runs shows
-exactly which keys the guess lights. If the magenta/cyan keys are not the physical
-thumb keys, correct the two constants — nothing else changes, because the
-detection logic takes the indices as data.
+leaves every other key and all underglow dark. That is how the position was
+confirmed; it stays as a diagnostic if the mapping is ever doubted.
