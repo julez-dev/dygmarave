@@ -23,6 +23,8 @@ pub struct Args {
     pub rows: bool,
     /// Paint the band sequence as a hue ramp.
     pub gradient: bool,
+    /// Light the guessed thumb clusters so a photograph can confirm them.
+    pub thumb_pattern: bool,
     /// Print band energies instead of a broadband meter.
     pub probe_spectrum: bool,
     /// Drive the board live from whatever the speakers are playing.
@@ -47,6 +49,7 @@ impl Default for Args {
             columns: false,
             rows: false,
             gradient: false,
+            thumb_pattern: false,
             probe_spectrum: false,
             live: false,
             fps: 30,
@@ -74,6 +77,7 @@ Options:
   --columns           paint each physical column a different colour
   --rows              paint each physical row a different colour
   --gradient          paint the band sequence as a hue ramp
+  --thumbs            light the guessed thumb clusters so a photo can confirm them
   --seconds <N>       how long to probe audio for (default 5)
   --source <ID>       capture this device instead of choosing a monitor
   -h, --help          show this help
@@ -119,6 +123,7 @@ where
             "--columns" => parsed.columns = true,
             "--rows" => parsed.rows = true,
             "--gradient" => parsed.gradient = true,
+            "--thumbs" | "--thumb-pattern" => parsed.thumb_pattern = true,
             "--probe-audio" => parsed.probe_audio = true,
             "--probe-spectrum" => {
                 parsed.probe_audio = true;
@@ -261,6 +266,7 @@ mod tests {
         assert!(parsed.columns);
         assert!(!parsed.probe_audio);
         assert!(args(&["--rows"]).unwrap().rows);
+        assert!(args(&["--thumbs"]).unwrap().thumb_pattern);
     }
 
     #[test]

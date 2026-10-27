@@ -27,6 +27,13 @@ use crate::level;
 use crate::spectrum::Spectrum;
 use crate::theme::Rgb;
 
+/// How many low bands count as "bass" for beat detection.
+///
+/// The spec warns that band 0 alone is unreliable because the FFT bins are wider
+/// than the lowest bands. Summing the lowest few bands covers the bass region
+/// without trusting a single band.
+pub const BASS_BANDS: usize = 4;
+
 /// Tunables for [`Dynamics`]. Defaults come from the spec's settled decisions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DynamicsConfig {
@@ -47,6 +54,15 @@ pub struct DynamicsConfig {
     /// 100 (40 dB) is chosen so a track mastered at the gate's -55 dBFS still
     /// reaches `target`; the gate rejects anything quieter before it matters.
     pub max_gain: f32,
+    /// How much louder than the rolling average bass energy a beat must be to
+    /// trigger a flash. The spec's default is 2.0.
+    pub beat_threshold: f32,
+    /// Time constant of the rolling average that the beat threshold compares
+    /// against. Long enough that a single hit stands out, short enough that a
+    /// sustained bass note raises the average and stops re-triggering.
+    pub beat_release_ms: f32,
+    /// How long the white flash lasts after a beat, in milliseconds.
+    pub flash_ms: f32,
 }
 
 impl Default for DynamicsConfig {
@@ -57,6 +73,9 @@ impl Default for DynamicsConfig {
             gate_db: -55.0,
             target: 0.7,
             max_gain: 100.0,
+            beat_threshold: 2.0,
+            beat_release_ms: 500.0,
+            flash_ms: 80.0,
         }
     }
 }
@@ -73,6 +92,14 @@ pub struct Dynamics {
     peaks: Vec<f32>,
     /// Whether each channel passed the gate on the last update.
     open: Vec<bool>,
+    /// Rolling average of the bass energy per channel, for beat detection.
+    energy_average: Vec<f32>,
+    /// Whether the channel's bass energy was above the threshold last frame.
+    was_above_threshold: Vec<bool>,
+    /// Remaining time of the white flash per channel, in milliseconds.
+    flash_remaining: Vec<f32>,
+    /// The level shown on the thumb cluster per channel, 0..=1.
+    thumb_level: Vec<f32>,
 }
 
 impl Dynamics {
@@ -84,6 +111,10 @@ impl Dynamics {
             levels: vec![0.0; channels * bands],
             peaks: vec![0.0; channels * bands],
             open: vec![false; channels],
+            energy_average: vec![0.0; channels],
+            was_above_threshold: vec![false; channels],
+            flash_remaining: vec![0.0; channels],
+            thumb_level: vec![0.0; channels],
         }
     }
 
@@ -109,6 +140,16 @@ impl Dynamics {
     /// The displayed level of one band, 0..=1.
     pub fn level(&self, channel: usize, band: usize) -> f32 {
         self.levels[channel * self.bands + band]
+    }
+
+    /// The level shown on one half's thumb cluster, 0..=1.
+    pub fn thumb_level(&self, channel: usize) -> f32 {
+        self.thumb_level[channel]
+    }
+
+    /// Whether a beat flash is currently active for this channel.
+    pub fn is_flashing(&self, channel: usize) -> bool {
+        self.flash_remaining[channel] > 0.0
     }
 
     /// Advances every band by `dt` seconds.
@@ -150,6 +191,36 @@ impl Dynamics {
                 let level = &mut self.levels[index];
                 *level = scaled.max(*level * decay);
             }
+
+            // Beat detection: sum the lowest few bands, which cover the bass
+            // region. Band 0 alone is unreliable because the FFT bins are wider
+            // than the lowest bands (spec's ticket 03 note).
+            let bass_energy: f32 = spectrum.bands(channel).iter().take(BASS_BANDS).sum();
+            let average = &mut self.energy_average[channel];
+            let threshold = *average * self.config.beat_threshold;
+            let above = bass_energy > threshold && bass_energy > 0.0;
+            // Trigger only on a rising edge: a sustained tone would otherwise keep
+            // re-triggering and leave the flash permanently on.
+            if above && !self.was_above_threshold[channel] {
+                self.flash_remaining[channel] = self.config.flash_ms;
+            }
+            self.was_above_threshold[channel] = above;
+
+            // Decay the rolling average slowly, so a single hit stands out against
+            // it and a sustained note quickly raises it.
+            let beat_release = (-dt * 1_000.0 / self.config.beat_release_ms.max(1.0)).exp();
+            *average = *average * beat_release + bass_energy * (1.0 - beat_release);
+
+            // Decay the flash timer by the elapsed time.
+            self.flash_remaining[channel] = (self.flash_remaining[channel] - dt * 1_000.0).max(0.0);
+
+            // The thumb level is the loudest displayed bass band. The AGC and
+            // envelope already normalised it, so it follows the music.
+            let mut max_level = 0.0f32;
+            for band in 0..BASS_BANDS.min(self.bands) {
+                max_level = max_level.max(self.levels[channel * self.bands + band]);
+            }
+            self.thumb_level[channel] = max_level;
         }
     }
 }
@@ -207,6 +278,20 @@ pub fn compose(dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
             }
             if let Some(colour) = colours.get_mut(*led as usize) {
                 *colour = ramp(dynamics.level(channel, band));
+            }
+        }
+
+        // The thumb cluster carries the channel's level, and flashes white on a
+        // beat before settling back. It is deliberately separate from the matrix
+        // bands so the spectrum stays readable while the thumbs carry rhythm.
+        let thumb_colour = if dynamics.is_flashing(channel) {
+            Rgb::new(255, 255, 255)
+        } else {
+            ramp(dynamics.thumb_level(channel))
+        };
+        for led in layout::thumb_leds(half) {
+            if let Some(colour) = colours.get_mut(*led as usize) {
+                *colour = thumb_colour;
             }
         }
     }
@@ -426,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn a_composed_frame_lights_only_the_letter_keys_it_has_bands_for() {
+    fn a_composed_frame_lights_the_bands_and_thumbs_and_leaves_the_rest_dark() {
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 2, BAND_COUNT);
         let mut spectrum = Spectrum::new(2, BAND_COUNT);
         spectrum.set_bands(0, &[1.0; BAND_COUNT]);
@@ -436,7 +521,11 @@ mod tests {
         let colours = compose(&dynamics, 132);
         let expected: Vec<u8> = [Half::Left, Half::Right]
             .into_iter()
-            .flat_map(layout::band_leds)
+            .flat_map(|half| {
+                layout::band_leds(half)
+                    .into_iter()
+                    .chain(layout::thumb_leds(half).iter().copied())
+            })
             .collect();
         for led in 0..132u8 {
             let should_be_lit = expected.contains(&led);
@@ -448,8 +537,157 @@ mod tests {
                 if should_be_lit { "" } else { "not " }
             );
         }
-        // Underglow and the thumbs stay dark.
-        assert!(colours[69..].iter().all(|colour| *colour == Rgb::BLACK));
+        // The rest of the underglow stays dark.
+        let thumb_set: Vec<u8> = [Half::Left, Half::Right]
+            .into_iter()
+            .flat_map(layout::thumb_leds)
+            .copied()
+            .collect();
+        for (led, colour) in colours.iter().enumerate().skip(69) {
+            if thumb_set.contains(&(led as u8)) {
+                continue;
+            }
+            assert_eq!(*colour, Rgb::BLACK, "underglow LED {led} must stay dark");
+        }
+    }
+
+    #[test]
+    fn a_bass_beat_triggers_a_white_flash() {
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        // A silent frame first, so the rolling average starts at zero.
+        dynamics.update(&spectral_flat(BAND_COUNT, 0.0), 1.0 / 30.0);
+        assert!(!dynamics.is_flashing(0));
+
+        // A bass hit: energy in the lowest BASS_BANDS bands.
+        let mut bands = vec![0.0; BAND_COUNT];
+        bands[..BASS_BANDS].fill(0.8);
+        dynamics.update(&spectrum_with(&bands), 1.0 / 30.0);
+        assert!(dynamics.is_flashing(0), "a bass hit must trigger a flash");
+    }
+
+    #[test]
+    fn a_sustained_bass_note_does_not_flash_forever() {
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        let mut bands = vec![0.0; BAND_COUNT];
+        bands[..BASS_BANDS].fill(0.8);
+        let hit = spectrum_with(&bands);
+
+        // The first frame triggers a flash.
+        dynamics.update(&hit, 1.0 / 30.0);
+        assert!(dynamics.is_flashing(0));
+
+        // After the flash duration (80 ms, ~3 frames), the flash ends.
+        for _ in 0..3 {
+            dynamics.update(&hit, 1.0 / 30.0);
+        }
+        assert!(
+            !dynamics.is_flashing(0),
+            "the flash must end after its duration"
+        );
+
+        // The sustained tone does not trigger a new flash (rising edge only).
+        for _ in 0..30 {
+            dynamics.update(&hit, 1.0 / 30.0);
+        }
+        assert!(
+            !dynamics.is_flashing(0),
+            "a sustained tone must not flash forever"
+        );
+    }
+
+    #[test]
+    fn the_flash_returns_to_the_level_colour() {
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        let mut bands = vec![0.0; BAND_COUNT];
+        bands[..BASS_BANDS].fill(0.8);
+        let hit = spectrum_with(&bands);
+
+        dynamics.update(&hit, 1.0 / 30.0);
+        assert!(dynamics.is_flashing(0));
+
+        // After the flash ends, the thumb level should still be non-zero.
+        for _ in 0..3 {
+            dynamics.update(&hit, 1.0 / 30.0);
+        }
+        assert!(!dynamics.is_flashing(0));
+        assert!(
+            dynamics.thumb_level(0) > 0.0,
+            "the level should still be visible after the flash"
+        );
+    }
+
+    #[test]
+    fn thumb_clusters_reflect_their_own_channel() {
+        // The AGC normalises every live channel to the same target, so differing
+        // input levels would still produce the same colour. The honest test of
+        // independence is one channel playing and the other silent: a shared
+        // value would light both thumbs or neither.
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 2, BAND_COUNT);
+        let mut bands_left = vec![0.0; BAND_COUNT];
+        bands_left[..BASS_BANDS].fill(0.8);
+        let mut spectrum = Spectrum::new(2, BAND_COUNT);
+        spectrum.set_bands(0, &bands_left);
+        spectrum.set_bands(1, &[0.0; BAND_COUNT]);
+
+        // Let the flash end so the level colour is visible, not the white flash.
+        for _ in 0..4 {
+            dynamics.update(&spectrum, 1.0 / 30.0);
+        }
+        let colours = compose(&dynamics, 132);
+        let left_thumb = layout::thumb_leds(Half::Left)[0];
+        let right_thumb = layout::thumb_leds(Half::Right)[0];
+        assert_ne!(
+            colours[left_thumb as usize],
+            Rgb::BLACK,
+            "the playing channel's thumb must be lit"
+        );
+        assert_eq!(
+            colours[right_thumb as usize],
+            Rgb::BLACK,
+            "the silent channel's thumb must be dark"
+        );
+    }
+
+    #[test]
+    fn matrix_bands_are_unaffected_by_the_beat_flash() {
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        let mut bands = vec![0.0; BAND_COUNT];
+        bands[..BASS_BANDS].fill(0.8);
+        let hit = spectrum_with(&bands);
+        dynamics.update(&hit, 1.0 / 30.0);
+        assert!(dynamics.is_flashing(0));
+
+        let colours = compose(&dynamics, 132);
+        // The band LED for band 0 must be the ramp of the level, not white.
+        let band_led = layout::band_leds(Half::Left)[0];
+        assert_ne!(
+            colours[band_led as usize],
+            Rgb::new(255, 255, 255),
+            "matrix bands must not flash"
+        );
+        // The thumb LED must be white.
+        let thumb_led = layout::thumb_leds(Half::Left)[0];
+        assert_eq!(
+            colours[thumb_led as usize],
+            Rgb::new(255, 255, 255),
+            "the thumb must flash white"
+        );
+    }
+
+    #[test]
+    fn silence_leaves_the_thumbs_dark() {
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        dynamics.update(&spectral_flat(BAND_COUNT, 0.0), 1.0 / 30.0);
+        let colours = compose(&dynamics, 132);
+        for half in [Half::Left, Half::Right] {
+            for led in layout::thumb_leds(half) {
+                assert_eq!(
+                    colours[*led as usize],
+                    Rgb::BLACK,
+                    "thumb {led} must be dark in silence"
+                );
+            }
+        }
     }
 
     #[test]

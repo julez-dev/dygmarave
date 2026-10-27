@@ -207,6 +207,58 @@ pub fn band_capacity(half: Half) -> usize {
     band_leds(half).len()
 }
 
+/// LEDs in the left thumb cluster.
+///
+/// The key map covers 0–68; everything from 69 up is underglow. The thumbs are
+/// the inner-bottom corner of each half's underglow, which is where the physical
+/// thumb keys sit. These indices are structural — the exact mapping needs a
+/// photograph to confirm — but the logic is independent of which indices are
+/// chosen: each half's cluster gets its own channel's level and beat flash.
+pub const THUMB_CLUSTER_LEFT: [u8; 4] = [69, 70, 71, 72];
+
+/// LEDs in the right thumb cluster.
+pub const THUMB_CLUSTER_RIGHT: [u8; 4] = [128, 129, 130, 131];
+
+/// The LED indices for one half's thumb cluster.
+pub fn thumb_leds(half: Half) -> &'static [u8] {
+    match half {
+        Half::Left => &THUMB_CLUSTER_LEFT,
+        Half::Right => &THUMB_CLUSTER_RIGHT,
+    }
+}
+
+/// A diagnostic pattern for locating the thumb clusters by photograph.
+///
+/// The thumb indices in [`THUMB_CLUSTER_LEFT`] and [`THUMB_CLUSTER_RIGHT`] are
+/// structural guesses: neither Dygma source records which underglow LEDs are the
+/// physical thumb keys. This paints the guessed left cluster magenta, the guessed
+/// right cluster cyan, and the rest of the underglow dim grey, so a photograph
+/// shows both what was guessed and what was left out. Correct the constants from
+/// the photo; the detection logic does not depend on which indices are chosen.
+pub fn thumb_pattern(count: usize) -> Vec<Rgb> {
+    const BACKDROP: Rgb = Rgb::new(20, 20, 20);
+    const LEFT: Rgb = Rgb::new(255, 0, 255);
+    const RIGHT: Rgb = Rgb::new(0, 255, 255);
+
+    let mut colors = vec![Rgb::BLACK; count];
+    // A dim backdrop over the whole underglow, so its extent is visible in the
+    // photo even where no thumb is guessed.
+    for slot in colors.iter_mut().skip(69) {
+        *slot = BACKDROP;
+    }
+    for led in THUMB_CLUSTER_LEFT {
+        if let Some(slot) = colors.get_mut(led as usize) {
+            *slot = LEFT;
+        }
+    }
+    for led in THUMB_CLUSTER_RIGHT {
+        if let Some(slot) = colors.get_mut(led as usize) {
+            *slot = RIGHT;
+        }
+    }
+    colors
+}
+
 /// A static test pattern: bands as a hue ramp, bass at the inner edge.
 pub fn gradient(count: usize) -> Vec<Rgb> {
     let mut colors = vec![Rgb::BLACK; count];
@@ -588,6 +640,48 @@ mod tests {
             }
             seen.dedup();
             assert_eq!(seen.len(), 1, "column {column} is not one colour");
+        }
+    }
+
+    #[test]
+    fn thumb_clusters_are_distinct_underglow_leds() {
+        // Each half's cluster must be separate, and must not overlap the key map.
+        let key_set: Vec<u8> = key_leds();
+        for half in [Half::Left, Half::Right] {
+            for led in thumb_leds(half) {
+                assert!(
+                    !key_set.contains(led),
+                    "thumb LED {led} must not be a key LED"
+                );
+                assert!(*led >= 69, "thumb LED {led} must be underglow");
+            }
+        }
+        // The two clusters must not share LEDs.
+        for led in THUMB_CLUSTER_LEFT {
+            assert!(
+                !THUMB_CLUSTER_RIGHT.contains(&led),
+                "LED {led} appears in both clusters"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thumb_pattern_lights_only_the_guessed_clusters_brightly() {
+        let colors = thumb_pattern(132);
+        // The guessed clusters are the only bright LEDs in the underglow.
+        for led in THUMB_CLUSTER_LEFT {
+            assert_eq!(colors[led as usize], Rgb::new(255, 0, 255));
+        }
+        for led in THUMB_CLUSTER_RIGHT {
+            assert_eq!(colors[led as usize], Rgb::new(0, 255, 255));
+        }
+        // Key LEDs stay dark.
+        for led in key_leds() {
+            assert_eq!(
+                colors[led as usize],
+                Rgb::BLACK,
+                "key LED {led} must be dark"
+            );
         }
     }
 

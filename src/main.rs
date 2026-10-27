@@ -68,7 +68,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "restoring the keyboard"
     })?;
 
-    if args.columns || args.rows || args.gradient {
+    if args.columns || args.rows || args.gradient || args.thumb_pattern {
         return paint_pattern(&args, &interrupted);
     }
     if args.probe_audio {
@@ -203,6 +203,11 @@ fn paint_pattern(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<
 
     let colors = if args.gradient {
         layout::gradient(count)
+    } else if args.thumb_pattern {
+        println!(
+            "\n  guessed thumb clusters — left magenta, right cyan; the dim grey is the rest of the underglow"
+        );
+        layout::thumb_pattern(count)
     } else if args.rows {
         println!("\n  row   colour (r,g,b)");
         for row in 0..layout::ROWS {
@@ -231,6 +236,8 @@ fn paint_pattern(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<
         "\n{}",
         if args.gradient {
             "Red = lowest band at the inner edge, blue = highest at the outer edges."
+        } else if args.thumb_pattern {
+            "Take a photograph: the magenta and cyan LEDs are where the thumbs are guessed to be.\n  If they are in the wrong place, the indices in layout.rs need correcting."
         } else {
             "Every key in one group shares a colour; underglow and thumbs stay dark."
         }
