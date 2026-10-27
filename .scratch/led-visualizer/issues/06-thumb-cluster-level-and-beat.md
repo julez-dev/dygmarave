@@ -40,3 +40,22 @@ only, so the thumbs and the spectrum never compete for the same LED.
 `dygmarave --thumbs` paints these two clusters magenta (left) and cyan (right) and
 leaves every other key and all underglow dark. That is how the position was
 confirmed; it stays as a diagnostic if the mapping is ever doubted.
+
+## Review round
+
+Code review returned **OK with notes** — all four criteria met, no P0/P1. The
+behavioural finding was folded; the rest were doc and robustness cleanups.
+
+- **P2 — beat detection bypassed the gate.** `bass_energy` summed the raw
+  spectrum, ignoring the freshly-computed `open` flag. A sub-gate transient (hum,
+  handling noise) would flash the thumbs white while the matrix stayed dark,
+  reintroducing for the thumbs the "silence leaves the board dark" invariant the
+  module exists to keep. Now a gated-closed channel contributes zero energy, and
+  `silence_leaves_the_thumbs_dark` uses a realistic −70 dBFS floor rather than
+  exactly zero, which would have passed either way and hidden the bug.
+- **P2 — the `compose` doc comment still claimed the thumbs stay black.** Corrected.
+- **P3 — the flash could vanish at low frame rates.** Setting the timer then
+  decrementing it by `dt` erased the flash outright when one frame's `dt` exceeded
+  `flash_ms` (`--fps` 1–10). The timer now decays *before* the trigger is set, so
+  the trigger frame is always visible.
+- **P3 — a possible `needless_range_loop`.** Rewritten as a slice fold.

@@ -194,8 +194,16 @@ impl Dynamics {
 
             // Beat detection: sum the lowest few bands, which cover the bass
             // region. Band 0 alone is unreliable because the FFT bins are wider
-            // than the lowest bands (spec's ticket 03 note).
-            let bass_energy: f32 = spectrum.bands(channel).iter().take(BASS_BANDS).sum();
+            // than the lowest bands (spec's ticket 03 note). A gated-closed
+            // channel contributes nothing: its raw spectrum still carries a noise
+            // floor, and letting that flash the thumbs would reintroduce for the
+            // thumbs the "silence leaves the board dark" invariant this module
+            // exists to keep.
+            let bass_energy: f32 = if open {
+                spectrum.bands(channel).iter().take(BASS_BANDS).sum()
+            } else {
+                0.0
+            };
             let average = &mut self.energy_average[channel];
             let threshold = *average * self.config.beat_threshold;
             let above = bass_energy > threshold && bass_energy > 0.0;
@@ -216,11 +224,12 @@ impl Dynamics {
 
             // The thumb level is the loudest displayed bass band. The AGC and
             // envelope already normalised it, so it follows the music.
-            let mut max_level = 0.0f32;
-            for band in 0..BASS_BANDS.min(self.bands) {
-                max_level = max_level.max(self.levels[channel * self.bands + band]);
-            }
-            self.thumb_level[channel] = max_level;
+            let start = channel * self.bands;
+            let end = start + BASS_BANDS.min(self.bands);
+            self.thumb_level[channel] = self.levels[start..end]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
         }
     }
 }
@@ -261,8 +270,9 @@ pub fn ramp(level: f32) -> Rgb {
 }
 
 /// Paints the dynamics onto the grid: band *n* of a half lights that half's
-/// *n*-th LED, inner to outer. LEDs without a band — underglow, the thumbs, and
-/// the top bands the half has no keys for — stay black.
+/// *n*-th LED, inner to outer. The thumb clusters carry their channel's level and
+/// flash on a beat. LEDs without a band — underglow and the top bands the half has
+/// no keys for — stay black.
 pub fn compose(dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
     let mut colours = vec![Rgb::BLACK; count];
     for (half, preferred) in [(Half::Left, 0), (Half::Right, 1)] {
@@ -676,8 +686,18 @@ mod tests {
 
     #[test]
     fn silence_leaves_the_thumbs_dark() {
+        // A realistic noise floor, not exactly zero: below the gate but non-zero,
+        // so an ungated beat detector would wrongly flash the thumbs. Exactly zero
+        // would pass either way and hide the bug.
+        let floor = 10f32.powf(-70.0 / 20.0);
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
-        dynamics.update(&spectral_flat(BAND_COUNT, 0.0), 1.0 / 30.0);
+        for _ in 0..30 {
+            dynamics.update(&spectral_flat(BAND_COUNT, floor), 1.0 / 30.0);
+        }
+        assert!(
+            !dynamics.is_flashing(0),
+            "the gate must stop a floor from flashing"
+        );
         let colours = compose(&dynamics, 132);
         for half in [Half::Left, Half::Right] {
             for led in layout::thumb_leds(half) {
