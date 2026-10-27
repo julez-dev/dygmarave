@@ -74,3 +74,26 @@ and bass-at-inner-edge all hold.
 gradient went red-at-bottom-left because of it. Asking the maintainer to describe
 positions verbally produced two data points that contradicted the firmware map —
 which is what prompted the photo, and the photo was worth more than either.
+
+## Review round
+
+Two-axis review of `7a25162`. Both axes independently judged it a block, and both
+were right about the substance rather than the tests:
+
+- **P1 — the snake jumped three rows.** In a column-wise walk the left inner
+  column has keys only at rows 0 and 3, so band 0 → band 1 jumped from LED 6 to
+  LED 25. The test that was supposed to catch this
+  (`bands_are_adjacent_or_one_column_apart`) only asserted that no key was reused,
+  so it passed regardless — a test whose name promised adjacency it never checked.
+  Fixed twice over: the walk now runs along **rows** (which are unbroken), and a
+  real adjacency test measures the row/column distance between consecutive bands.
+- **P1 — symmetry was claimed, not achieved.** I had written "the mirroring
+  stands". It does not: rows hold 7,6,6,7 keys on the left and 7,7,7,6 on the
+  right, so the halves cannot be exact mirror images. The ADR and this ticket now
+  say so, a test pins the single left key with no counterpart, and the picture is
+  mirrored everywhere it physically can be.
+- **P1 — the table had no per-cell lock.** Set-level invariants (68 LEDs, unique,
+  no LED 40) would have let a transposed pair through. The whole table is now
+  asserted against a recorded literal.
+- **P2** — `column_pattern` and `row_pattern` duplicated a loop; magic hue values
+  undocumented; `--gradient` silently won over `--rows`/`--columns`.

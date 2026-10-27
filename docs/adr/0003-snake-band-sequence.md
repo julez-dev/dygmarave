@@ -30,4 +30,14 @@ Consequences:
   lost bands are the least visible.
 - **The board has 68 key LEDs, not 64.** LED 40 sits on no key, and LED 20 —
   the `\` key — never lights up at all on this unit, confirmed in the photo.
-- The snake, the mirroring, and bass-at-the-inner-edge all stand as decided.
+- **The snake runs along rows, not columns.** ADR-0003 asked for columns; that is
+  impossible here because the inner column is partial (the left half has keys at
+  its rows 0 and 3 with a hole between), so a column-wise walk jumps three rows.
+  Rows are unbroken, so alternating along rows keeps consecutive bands on
+  neighbouring keys. It still starts at the inner edge, so bass stays at the
+  centre.
+- **The halves are not exactly symmetric, and cannot be.** Rows hold 7,6,6,7 keys
+  on the left and 7,7,7,6 on the right. Every left key except one (row 3, inner
+  column) has a mirrored counterpart; the right half simply has one more key in
+  its inner column. A test records that single exception so a second unexplained
+  hole fails rather than hides.
