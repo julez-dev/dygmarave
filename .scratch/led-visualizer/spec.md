@@ -22,7 +22,7 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | LED count | Queried every startup by counting `led.theme` triples; measured 132, of which indices 20 and 131 ignore writes | — |
 | LED mode | Query current mode, switch to a static non-repainting one, restore on exit (mode is EEPROM-persisted) | — |
 | Frame write | Fire-and-forget, no per-frame terminator wait; a periodic health probe catches a dead port | — |
-| Bands | 28 per half, 56 total; snake sequence; right half mirrored, bass at inner edges | ADR-0003 |
+| Bands | 28 analysed; a half displays 26 (left) / 27 (right) because that is how many letter keys it has; snake, mirrored, bass at inner edges | ADR-0003 |
 | Audio | System output only, PulseAudio/PipeWire monitor source via `cpal` | — |
 | Analysis | 1024-sample window (≈21 ms at 48 kHz), log-spaced 40 Hz–16 kHz | — |
 | Dynamics | Instant attack, slow exponential decay, per-band AGC, gate to black on silence | — |
@@ -121,6 +121,11 @@ Measured on 2026-10-27 against a wired ANSI Raise, firmware `v1.0.12-beta b3df55
 - **Capturing a specific sink node dies when that sink suspends.** Measuring an idle HDMI sink produced "Device disconnected" on the stream while `sink_default` stayed healthy, because PipeWire suspends idle nodes. Anything that pins one sink needs reconnect handling (ticket 08).
 - **The spectrum is measured, not assumed.** A 12-second log sweep (60 Hz → 15 kHz) played into a sink and read back through the monitor moved the peak band **6 → 8 → 10 → 12 → 14 → 16 → 19 → 21 → 23 → 25 → 27**, strictly monotonic and ending in the top band; a 1 kHz tone landed in band 15 (~1109 Hz). Amplitude reads true: a 0.5 sine measures ~0.5 after correcting for the Hann window's 1.5-bin noise bandwidth.
 - **Bass is coarser than one band.** 1024 samples at 48 kHz gives 46.9 Hz bins, wider than the lowest bands (40–62 Hz), so a tone below ~150 Hz legitimately straddles neighbours and cannot be assigned to a single band. Acceptable for a display where bass is a blur, but it rules out precise bass banding without a longer window (which would cost transient response).
+- **The physical grid is 5×16 with 68 key LEDs**, verified by photograph: left half columns 0–7 (LEDs 0–32), right half columns 8–15 (LEDs 33–68), mirrored about the centre gap. LED 40 sits on no key, and **LED 20 — the `\` key — is dead on this unit**.
+- **Letter rows hold 26 keys on the left and 27 on the right**, not 28, because the physical grid has holes. Bands 26/27 (left) fall off the end.
+- **Only a layer change repaints the board**, not ordinary typing. A 30 fps loop hides it within one frame, so it is a cosmetic flash rather than a blocker.
+- **The physical key map is Bazecor's, not the firmware's.** Verified on hardware: LED 0 is Escape (top-left) and LED 26 is left Ctrl (bottom-left), matching Bazecor's 5×16 physical map and contradicting the firmware's 4×16 keymap map. Bazecor also reports **69 key LEDs (0–68)** with underglow from 69, so the earlier "64 keys" figure was wrong.
+- **A layer change repaints the whole board**, wiping a written frame. A 30 fps loop would restore it within a frame, but this is the first sign that written frames are less durable than assumed; whether ordinary typing does it too is unresolved.
 - **Channel separation is correct end to end.** A 440 Hz tone written to the left channel only measured **L −10.5 dBFS, R −100.0 dBFS** through the monitor, so the interleaved-sample maths can be trusted for per-half colours.
 - **No OS-level exclusive lock exists.** Neither Bazecor nor `dygma_focus` requests one (`set_exclusive(false)`), so a busy port never raises `EBUSY` and the retry path cannot detect Bazecor on its own — hence the process check.
 

@@ -14,6 +14,7 @@
 mod args;
 mod audio;
 mod bench;
+mod layout;
 mod level;
 mod link;
 mod session;
@@ -59,6 +60,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "restoring the keyboard"
     })?;
 
+    if args.columns || args.rows || args.gradient {
+        return paint_pattern(&args, &interrupted);
+    }
     if args.probe_audio {
         return probe_audio(&args, &interrupted);
     }
@@ -151,6 +155,84 @@ fn run() -> Result<(), Box<dyn Error>> {
         "\nrestored baseline theme and LED mode {} ({})",
         session.baseline().mode.code(),
         session.baseline().mode.name()
+    );
+    Ok(())
+}
+
+/// Paints a diagnostic pattern on the board and holds it, so its geometry can be
+/// checked by eye or in a photograph.
+fn paint_pattern(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    let device = match &args.port {
+        Some(port) => DygmaLink::from_port(port)?,
+        None => DygmaLink::discover()?,
+    };
+    println!("port: {}", device.port_name());
+    let mut session = Session::open(device)?;
+    let count = session.led_count();
+    println!(
+        "LED count: {count}; the grid claims {} key LEDs across {} rows x {} columns",
+        layout::key_leds().len(),
+        layout::ROWS,
+        layout::COLUMNS
+    );
+
+    if args.gradient {
+        for half in [layout::Half::Left, layout::Half::Right] {
+            let leds = layout::band_leds(half);
+            let lowest = leds.first().copied().unwrap_or_default();
+            let highest = leds.last().copied().unwrap_or_default();
+            println!(
+                "  {} half: {} bands, band 0 on LED {lowest} (inner), last band on LED {highest} (outer)",
+                half.name(),
+                leds.len()
+            );
+        }
+        println!();
+    }
+
+    let colors = if args.gradient {
+        layout::gradient(count)
+    } else if args.rows {
+        println!("\n  row   colour (r,g,b)");
+        for row in 0..layout::ROWS {
+            println!("  {row}     {}", layout::row_colour(row));
+        }
+        layout::row_pattern(count)
+    } else {
+        println!("\n  column   half     colour (r,g,b)");
+        for column in 0..layout::COLUMNS {
+            let half = if column < 8 {
+                layout::Half::Left
+            } else {
+                layout::Half::Right
+            };
+            println!(
+                "  {column:>6}   {:<6}   {}",
+                half.name(),
+                layout::column_colour(column)
+            );
+        }
+        layout::column_pattern(count)
+    };
+
+    session.write_frame(&Frame::from_colors(&colors))?;
+    println!(
+        "\n{}",
+        if args.gradient {
+            "Red = lowest band at the inner edge, blue = highest at the outer edges."
+        } else {
+            "Every key in one group shares a colour; underglow and thumbs stay dark."
+        }
+    );
+    println!("Holding {} s (Ctrl-C to end early)…", args.seconds);
+    let deadline = Instant::now() + Duration::from_secs(args.seconds);
+    while Instant::now() < deadline && !interrupted.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    session.restore()?;
+    println!(
+        "restored baseline theme and LED mode {}",
+        session.baseline().mode.code()
     );
     Ok(())
 }

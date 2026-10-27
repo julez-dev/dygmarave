@@ -17,6 +17,12 @@ pub struct Args {
     pub frames: u32,
     /// Probe the audio path instead of the LED path.
     pub probe_audio: bool,
+    /// Paint each physical column a different colour.
+    pub columns: bool,
+    /// Paint each physical row a different colour.
+    pub rows: bool,
+    /// Paint the band sequence as a hue ramp.
+    pub gradient: bool,
     /// Print band energies instead of a broadband meter.
     pub probe_spectrum: bool,
     /// How long to probe audio for.
@@ -34,6 +40,9 @@ impl Default for Args {
             hold_ms: 3_000,
             frames: 120,
             probe_audio: false,
+            columns: false,
+            rows: false,
+            gradient: false,
             probe_spectrum: false,
             seconds: 5,
             source: None,
@@ -54,6 +63,9 @@ Options:
   --frames <N>        frames to write when measuring (default 120)
   --probe-audio       probe the audio path instead of the LED path
   --probe-spectrum    probe audio and print 28 log-spaced band energies
+  --columns           paint each physical column a different colour
+  --rows              paint each physical row a different colour
+  --gradient          paint the band sequence as a hue ramp
   --seconds <N>       how long to probe audio for (default 5)
   --source <ID>       capture this device instead of choosing a monitor
   -h, --help          show this help
@@ -94,6 +106,9 @@ where
                 let value = next_value(&mut args, &flag)?;
                 parsed.colour = parse_colour(&value)?;
             }
+            "--columns" => parsed.columns = true,
+            "--rows" => parsed.rows = true,
+            "--gradient" => parsed.gradient = true,
             "--probe-audio" => parsed.probe_audio = true,
             "--probe-spectrum" => {
                 parsed.probe_audio = true;
@@ -199,6 +214,14 @@ mod tests {
         assert!(parsed.probe_audio);
         assert_eq!(parsed.seconds, 2);
         assert_eq!(parsed.source.as_deref(), Some("pipewire:42"));
+    }
+
+    #[test]
+    fn the_pattern_flags_are_independent_of_the_audio_probes() {
+        let parsed = args(&["--columns"]).unwrap();
+        assert!(parsed.columns);
+        assert!(!parsed.probe_audio);
+        assert!(args(&["--rows"]).unwrap().rows);
     }
 
     #[test]
