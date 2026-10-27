@@ -73,7 +73,8 @@ Options:
   --probe-audio       probe the audio path instead of the LED path
   --probe-spectrum    probe audio and print 28 log-spaced band energies
   --live              drive the board live from the output mix (Ctrl-C stops)
-  --fps <N>           frames per second for --live (default 30)
+  --fps <N>           frames per second for --live (default 30; lowered
+                      automatically when the board cannot keep up)
   --columns           paint each physical column a different colour
   --rows              paint each physical row a different colour
   --gradient          paint the band sequence as a hue ramp

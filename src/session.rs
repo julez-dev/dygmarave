@@ -159,6 +159,15 @@ impl HoldReport {
     }
 }
 
+/// Parses the board's answer to `led.mode`.
+fn mode_from_reply(reply: String) -> Result<LedMode, SessionError> {
+    let code = reply
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| SessionError::UnreadableMode(reply.clone()))?;
+    Ok(LedMode::from_code(code))
+}
+
 /// An open session that restores the board when it ends.
 pub struct Session<L: Link> {
     link: L,
@@ -172,21 +181,14 @@ impl<L: Link> Session<L> {
     /// The mode is switched before any frame is written, because in modes 1–3
     /// the firmware would paint over the first frame within a second.
     pub fn open(mut link: L) -> Result<Self, SessionError> {
-        let mode_reply = link.query("led.mode")?;
-        let code = mode_reply
-            .trim()
-            .parse::<u8>()
-            .map_err(|_| SessionError::UnreadableMode(mode_reply.clone()))?;
+        let mode = mode_from_reply(link.query("led.mode")?)?;
         let theme = theme::parse_theme_reply(&link.query("led.theme")?)?;
 
         link.send(&format!("led.mode {}", LedMode::Static.code()))?;
 
         Ok(Self {
             link,
-            baseline: Baseline {
-                mode: LedMode::from_code(code),
-                theme,
-            },
+            baseline: Baseline { mode, theme },
             restored: false,
         })
     }
@@ -203,6 +205,22 @@ impl<L: Link> Session<L> {
     /// The firmware version string, for the log.
     pub fn firmware(&mut self) -> Result<String, SessionError> {
         Ok(self.link.query("version")?.trim().to_string())
+    }
+
+    /// Proves the board is still answering, not merely accepting bytes.
+    ///
+    /// A wedged device can keep taking writes into the kernel buffer while
+    /// nothing reaches the firmware, so a successful [`Session::write_frame`] is
+    /// not proof the board is alive. A query must come back for the link to be
+    /// trusted; anything else means the port is gone or frozen. The query drains
+    /// first, so it also clears acknowledgements as a side effect.
+    ///
+    /// `led.mode` is read-only: the mode *setter* wears EEPROM, but reading it does
+    /// not. On a wedged port the query blocks for the link's five-second reply
+    /// timeout — the price of a definitive answer. The board is already frozen, so
+    /// the delay costs nothing the picture was still showing.
+    pub fn health_check(&mut self) -> Result<LedMode, SessionError> {
+        mode_from_reply(self.link.query("led.mode")?)
     }
 
     /// A full frame of one colour, sized to this board.
@@ -382,6 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn writing_a_frame_is_fire_and_forget() {
+        // The board acknowledges every frame, and waiting for that ack would halve
+        // the achievable rate: ticket 01 measured ~38 fps request/response against
+        // ~70 fire-and-forget. A frame write must be one send and nothing else.
+        let mut session = opened(4);
+        let sent = session.link.log.len();
+        session
+            .write_frame(&Frame::uniform(4, Rgb::new(1, 2, 3)))
+            .unwrap();
+        assert_eq!(
+            session.link.log.len(),
+            sent + 1,
+            "one command, no read-back"
+        );
+        assert!(session.link.log.last().unwrap().starts_with("led.theme "));
+    }
+
+    #[test]
     fn restore_rewrites_baseline_theme_then_mode() {
         let mut session = opened(4);
         session.restore().unwrap();
@@ -436,6 +472,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(drained.acks_drained, 3);
+    }
+
+    #[test]
+    fn a_health_check_proves_the_board_still_answers() {
+        let mut session = opened(4);
+        // The board answers a *fresh* query, not just accepts another write.
+        session
+            .link
+            .replies
+            .insert("led.mode".into(), "0 \r\n".into());
+        let queries_before = session.link.count("led.mode");
+        assert_eq!(session.health_check().unwrap(), LedMode::Static);
+        // It is a real query, so it appears in the log after the open's own.
+        assert_eq!(session.link.count("led.mode"), queries_before + 1);
+        assert_eq!(session.link.log.last().unwrap(), "led.mode");
+    }
+
+    #[test]
+    fn a_health_check_reports_a_port_that_stops_answering() {
+        let mut session = opened(4);
+        // The port accepts what it has already been given and then goes away.
+        session.link.fail_after = Some(session.link.log.len());
+        let error = session.health_check().unwrap_err();
+        assert!(
+            matches!(error, SessionError::Link(_)),
+            "a dead port must surface as a link error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_health_check_rejects_a_reply_it_cannot_parse() {
+        let mut session = opened(4);
+        session
+            .link
+            .replies
+            .insert("led.mode".into(), "???\r\n".into());
+        assert!(matches!(
+            session.health_check().unwrap_err(),
+            SessionError::UnreadableMode(_)
+        ));
     }
 
     #[test]

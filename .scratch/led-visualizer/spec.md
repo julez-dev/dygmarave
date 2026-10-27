@@ -18,10 +18,10 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | Port | Exclusive ownership; Bazecor closed; keep running and retry while busy/unplugged | ADR-0002 |
 | Bazecor | Detected by process check at startup and before each retry; no writing while present (there is no OS lock to rely on) | ADR-0002 |
 | Serial stack | `dygma_focus` for discovery and mode vocabulary; `serialport` for I/O so acknowledgements can be drained | — |
-| Ack drain | Discard buffered replies every 64 frames; the board acks every command including frames | — |
+| Ack drain | Discard buffered replies on a 250 ms wall-clock cadence; the board acks every command including frames | ticket 07 |
 | LED count | Queried every startup by counting `led.theme` triples; measured 132, of which indices 20 and 131 ignore writes | — |
 | LED mode | Query current mode, switch to a static non-repainting one, restore on exit (mode is EEPROM-persisted) | — |
-| Frame write | Fire-and-forget, no per-frame terminator wait; a periodic health probe catches a dead port | — |
+| Frame write | Fire-and-forget, no per-frame terminator wait; a periodic read-only `led.mode` query catches a dead port (no EEPROM write) | ticket 07 |
 | Layer-change flash | Accepted, not prevented: the firmware repaints on a layer change and no Focus command can stop it, so the next frame redraws over it (~33 ms at 30 fps) | — |
 | Audio backlog | Drains every captured block in order each frame, so the analyzer's window stays contiguous; only a multi-second stall drops the oldest whole blocks (cap 32) | ticket 05 |
 | Bands | 28 analysed; a half displays 26 (left) / 27 (right) because that is how many letter keys it has; snake, mirrored, bass at inner edges | ADR-0003 |
@@ -30,7 +30,7 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | Dynamics | Instant attack, slow exponential decay, per-band AGC, gate to black on silence | — |
 | Colour | Continuous dark→hot perceptual ramp (black → red → orange → white) | — |
 | Thumbs | Per-channel level glow per half; white flash on bass onset | — |
-| Rate | 30 fps target; measured ceiling 69.5 fps, adaptive downward; the budget is typing latency, not the wire | — |
+| Rate | 30 fps target; measured ceiling 69.5 fps, adaptive downward — floor 5 fps, step a sixth of the target, two resyncs or <90% achieved in a 2 s window to degrade, 6 s clean to recover; the budget is typing latency, not the wire | ticket 07 |
 | Lifecycle | Read baseline theme at startup, write it back on clean exit | — |
 | Config | XDG TOML at `~/.config/dygmarave/config.toml`, CLI overrides | — |
 | Discovery | `/dev/serial/by-id` match on Dygma VID/PID, explicit path override | — |
@@ -137,7 +137,7 @@ Measured on 2026-10-27 against a wired ANSI Raise, firmware `v1.0.12-beta b3df55
 ## Known open items
 
 - **Index→key table** must be built by correlating the runtime LED order against `RaiseANSIColorMap.png`; no machine-readable table exists upstream. Ticket 04.
-- **Ack-drain cadence** is a stopgap in ticket 01 (every 64 frames). Ticket 07 owns making it adaptive and proving the port never stalls over a long show.
+- **Ack-drain cadence** is now wall-clock based in ticket 07 (every 250 ms), and the health probe queries every 10 s. A real-board soak is still needed to prove the port never stalls over an hour-long show.
 - **Per-sink capture and sink suspension** need reconnect handling before the daemon can run unattended; ticket 08 owns it, and ticket 05 should prefer `sink_default` for stability.
 
 ## Risks

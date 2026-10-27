@@ -345,6 +345,16 @@ impl Pacer {
         (wait, false)
     }
 
+    /// Changes the period, realigning the next deadline to one new period from
+    /// `now`.
+    ///
+    /// A deliberate rate change is not a missed deadline, so it must not count as
+    /// a dropped frame; the schedule simply continues on the new grid.
+    pub fn set_period(&mut self, period: Duration, now: Instant) {
+        self.period = period;
+        self.next = now + period;
+    }
+
     #[cfg(test)]
     pub fn dropped(&self) -> u64 {
         self.dropped
@@ -790,6 +800,26 @@ mod tests {
         assert!(!resync);
         assert_eq!(wait, Duration::ZERO);
         assert_eq!(pacer.dropped(), 1);
+    }
+
+    #[test]
+    fn changing_the_rate_realigns_the_deadline_without_counting_a_miss() {
+        let start = Instant::now();
+        let mut pacer = Pacer::new(Duration::from_millis(33), start);
+
+        // One frame at 30 fps, landing exactly on its deadline.
+        let (wait, resync) = pacer.wait(start);
+        assert!(!resync);
+        assert_eq!(wait, Duration::from_millis(33));
+
+        // The rate changes mid-run. The next deadline moves to one new period
+        // from now, and a deliberate change must not be recorded as a stall.
+        let now = start + Duration::from_millis(33);
+        pacer.set_period(Duration::from_millis(66), now);
+        let (wait, resync) = pacer.wait(now);
+        assert!(!resync, "a deliberate rate change is not a missed deadline");
+        assert_eq!(wait, Duration::from_millis(66));
+        assert_eq!(pacer.dropped(), 0, "a rate change is not a dropped frame");
     }
 
     #[test]

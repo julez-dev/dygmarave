@@ -11,7 +11,8 @@
 //! * `--probe-spectrum` prints 28 log-spaced band energies per channel, the
 //!   analysis the renderer will consume (ticket 03);
 //! * `--live` is the product: the output mix drives the board continuously,
-//!   band energies through the colour ramp at a steady frame rate (ticket 05).
+//!   band energies through the colour ramp at an adaptive frame rate that lowers
+//!   itself when the board cannot keep up (tickets 05 and 07).
 
 mod args;
 mod audio;
@@ -496,6 +497,42 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
     Ok(())
 }
 
+/// How often to discard the board's acknowledgements. The board acks every frame,
+/// so over an hour-long show the kernel buffer would fill and stall the port; a
+/// quarter second keeps it far from full and costs one short read four times a
+/// second. A frame count would stretch when the adaptive rate lowers.
+const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often to prove the board is still answering. A wedged port can keep
+/// accepting writes into the kernel buffer while nothing reaches the firmware, so
+/// a periodic query is the only proof the board is alive.
+const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often to say what rate is actually being achieved, so a slow board is
+/// visible rather than mysterious.
+const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A wall-clock cadence for work that must happen regularly but not every frame.
+struct Cadence {
+    last: Instant,
+    every: Duration,
+}
+
+impl Cadence {
+    fn new(every: Duration, start: Instant) -> Self {
+        Self { last: start, every }
+    }
+
+    /// True when `every` has elapsed since the last time this returned true.
+    fn due(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last) < self.every {
+            return false;
+        }
+        self.last = now;
+        true
+    }
+}
+
 /// Runs the visualizer until interrupted: audio in, frames out, steady pace.
 ///
 /// The audio source is resolved *before* the board is touched, so a failed
@@ -528,40 +565,93 @@ fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Bo
     println!(
         "  port {port_name} — {count} LEDs, {} fps, {} bands",
         visualizer.fps(),
-        spectrum::BAND_COUNT
+        visualizer.bands()
     );
 
-    let mut frames = 0u64;
+    let started = Instant::now();
+    let mut drain = Cadence::new(DRAIN_INTERVAL, started);
+    let mut probe = Cadence::new(PROBE_INTERVAL, started);
+    let mut report = Cadence::new(REPORT_INTERVAL, started);
     let mut acks = 0u64;
     while !interrupted.load(Ordering::SeqCst) {
+        let now = Instant::now();
         // Drain every block in order so the analyzer's window stays contiguous;
         // only a multi-second stall trips the cap and drops the oldest whole
         // blocks. Draining to just the newest block would splice two moments of
         // audio together and click, which reads as strobing at the frame rate.
         let (latest, dropped) = live::Live::drain(&receiver);
-        let frame = visualizer.step(latest.as_ref(), Instant::now(), dropped);
+        let frame = visualizer.step(latest.as_ref(), now, dropped);
         session.write_frame(&frame)?;
-        frames += 1;
-        if frames.is_multiple_of(bench::DRAIN_EVERY as u64) {
+
+        // Pacing after the write, so the board's write time is absorbed by the
+        // schedule instead of pushing every frame past its deadline. This may
+        // lower or raise the rate when the board cannot keep up.
+        let before = visualizer.fps();
+        let wait = visualizer.wait(now);
+        let after = visualizer.fps();
+        if after < before {
+            println!(
+                "  board falling behind — lowered frame rate {before} → {after} fps (spectrum unchanged)"
+            );
+        } else if after > before {
+            println!("  board keeping up — raised frame rate {before} → {after} fps");
+        }
+
+        // Discard acknowledgements unconditionally, on a wall-clock cadence.
+        if drain.due(now) {
             acks += session.drain_acks()? as u64;
         }
-        // Pacing after the write, so the board's write time is absorbed by the
-        // schedule instead of pushing every frame past its deadline.
-        let wait = visualizer.wait(Instant::now());
+        // Prove the board is still answering, not just accepting writes. The
+        // query drains first, so it also clears acknowledgements as a side effect.
+        if probe.due(now) {
+            session.health_check()?;
+        }
+        // Report the rate over the last observation window, not an average that an
+        // hour of healthy running would hide a recent slowdown behind.
+        if report.due(now) {
+            match visualizer.recent_fps() {
+                Some(recent) => println!(
+                    "  {recent:.1} fps in the last window against a {} fps target",
+                    visualizer.target_fps()
+                ),
+                None => println!(
+                    "  {:.1} fps achieved so far against a {} fps target",
+                    visualizer.achieved_fps(now),
+                    visualizer.target_fps()
+                ),
+            }
+        }
+
         if let Some(error) = capture.take_error() {
             // A mid-set stream failure is not "no signal was ever heard" — that
             // error means every sample was zero. Report the actual failure and
             // let Session's Drop put the board back on the way out.
-            return Err(
-                format!("audio stream stopped mid-set after {frames} frames: {error}").into(),
-            );
+            return Err(format!(
+                "audio stream stopped mid-set after {} frames: {error}",
+                visualizer.frames()
+            )
+            .into());
         }
         session::sleep_unless_interrupted(wait, interrupted);
     }
 
     println!();
+    let elapsed = started.elapsed();
     println!(
-        "  {frames} frames, {} blocks discarded after a stall, {acks} acknowledgements discarded, {} pacing resyncs",
+        "  {} frames in {:.1}s — {:.1} fps achieved against a {} fps target",
+        visualizer.frames(),
+        elapsed.as_secs_f64(),
+        visualizer.achieved_fps(Instant::now()),
+        visualizer.target_fps()
+    );
+    if visualizer.fps() != visualizer.target_fps() {
+        println!(
+            "  ended at {} fps — the board could not sustain the target",
+            visualizer.fps()
+        );
+    }
+    println!(
+        "  {} blocks discarded after a stall, {acks} acknowledgements discarded, {} pacing resyncs",
         visualizer.dropped_blocks(),
         visualizer.resyncs()
     );
