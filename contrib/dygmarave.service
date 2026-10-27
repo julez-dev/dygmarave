@@ -1,0 +1,37 @@
+[Unit]
+Description=dygmarave — audio-reactive LEDs for the Dygma Raise
+# Run as a user unit, at login. Install with:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/dygmarave.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dygmarave
+#
+# A user unit runs in the user manager, where sound.target does not exist; order
+# after the user's audio stack instead. Socket activation means PipeWire is usually
+# already up, but this makes the dependency explicit when it is not.
+After=pipewire.service wireplumber.service
+# The daemon retries a lost or busy port internally and stays alive. If it fails to
+# start at all (e.g. no audio device at login), back off a few times and then stop
+# rather than restarting in a tight loop. Five attempts in ten minutes is enough to
+# ride out a slow login without masking a real failure.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Adjust to where the binary is installed. `cargo install --path .` puts it in
+# ~/.cargo/bin, which this default assumes.
+ExecStart=%h/.cargo/bin/dygmarave --live
+# The daemon retries a lost port internally and stays alive, so systemd only
+# restarts it on a real crash. A SIGTERM stops it cleanly (the daemon restores the
+# board's baseline theme and mode), which does not trigger a restart.
+Restart=on-failure
+RestartSec=5s
+# Give the daemon time to restore the board on stop before systemd escalates.
+TimeoutStopSec=15s
+# The visualizer writes to the serial port and reads the audio monitor; it needs
+# no special privileges beyond the user's own session.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

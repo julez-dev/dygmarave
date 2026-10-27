@@ -159,6 +159,13 @@ impl HoldReport {
     }
 }
 
+/// Reads the board's current theme and mode.
+fn read_baseline<L: Link>(link: &mut L) -> Result<Baseline, SessionError> {
+    let mode = mode_from_reply(link.query("led.mode")?)?;
+    let theme = theme::parse_theme_reply(&link.query("led.theme")?)?;
+    Ok(Baseline { mode, theme })
+}
+
 /// Parses the board's answer to `led.mode`.
 fn mode_from_reply(reply: String) -> Result<LedMode, SessionError> {
     let code = reply
@@ -180,15 +187,32 @@ impl<L: Link> Session<L> {
     ///
     /// The mode is switched before any frame is written, because in modes 1–3
     /// the firmware would paint over the first frame within a second.
-    pub fn open(mut link: L) -> Result<Self, SessionError> {
-        let mode = mode_from_reply(link.query("led.mode")?)?;
-        let theme = theme::parse_theme_reply(&link.query("led.theme")?)?;
+    pub fn open(link: L) -> Result<Self, SessionError> {
+        Self::open_with(link, None)
+    }
+
+    /// Opens with a known baseline, for reconnects.
+    ///
+    /// A reconnect must restore the theme and mode that were in use *before the
+    /// daemon started*, not whatever the board shows now. After a Bazecor pause or
+    /// a replug the board still shows our last frame in static mode, so re-reading
+    /// the baseline would capture our own output and restore it on exit. Passing
+    /// the first baseline forward keeps the original safe.
+    ///
+    /// Still switches to static mode: Bazecor or a reset may have changed the mode
+    /// while the daemon was away.
+    pub fn open_with(link: L, baseline: Option<Baseline>) -> Result<Self, SessionError> {
+        let mut link = link;
+        let baseline = match baseline {
+            Some(baseline) => baseline,
+            None => read_baseline(&mut link)?,
+        };
 
         link.send(&format!("led.mode {}", LedMode::Static.code()))?;
 
         Ok(Self {
             link,
-            baseline: Baseline { mode, theme },
+            baseline,
             restored: false,
         })
     }
@@ -280,6 +304,23 @@ impl<L: Link> Session<L> {
         interrupted: &AtomicBool,
     ) -> Result<BenchResult, LinkError> {
         bench::measure(&mut self.link, frame, frames, interrupted)
+    }
+
+    /// Closes the port without restoring the board.
+    ///
+    /// Used when another program takes the port over — Bazecor, say — and the
+    /// daemon must let go without writing the baseline into a device it no longer
+    /// owns. The board is left exactly as found: no restore commands are sent,
+    /// and `Drop` stays quiet because the session is marked restored. Reopening a
+    /// fresh [`Session`] later reads whatever the board now shows, so a daemon that
+    /// was paused mid-show resumes against the colours it actually has.
+    ///
+    /// Dropping the link is what closes the port. The daemon keeps no reference to
+    /// it afterwards, so reopening after a pause needs a freshly opened session.
+    pub fn release(mut self) {
+        // Nothing to send. Marking the session restored stops `Drop` restoring a
+        // baseline this process no longer owns.
+        self.restored = true;
     }
 
     /// Puts the baseline theme and LED mode back. Safe to call twice.
@@ -512,6 +553,44 @@ mod tests {
             session.health_check().unwrap_err(),
             SessionError::UnreadableMode(_)
         ));
+    }
+
+    #[test]
+    fn reopening_with_a_known_baseline_skips_the_read() {
+        // A reconnect keeps the pre-startup baseline; the board now shows our last
+        // frame in static mode, so re-reading would capture our own output.
+        let link = SharedLink::with_replies(&[]);
+        let baseline = Baseline {
+            mode: LedMode::Rainbow,
+            theme: vec![Rgb::new(1, 2, 3)],
+        };
+        let session = Session::open_with(link.clone(), Some(baseline.clone())).unwrap();
+        assert_eq!(session.baseline(), &baseline);
+        assert_eq!(
+            link.log(),
+            vec!["led.mode 0".to_string()],
+            "no read, just the switch to static"
+        );
+    }
+
+    #[test]
+    fn releasing_the_port_restores_nothing() {
+        // The daemon lets go when Bazecor takes the port. Releasing must not write
+        // the baseline into a device another program now owns, and the `Drop` that
+        // follows must not either.
+        let link =
+            SharedLink::with_replies(&[("led.mode", "1 \r\n"), ("led.theme", &baseline_theme(4))]);
+        let mut session = Session::open(link.clone()).unwrap();
+        session
+            .write_frame(&Frame::uniform(4, Rgb::new(9, 9, 9)))
+            .unwrap();
+        let commands = link.log().len();
+        session.release();
+        assert_eq!(
+            link.log().len(),
+            commands,
+            "release must send nothing, and Drop must stay quiet"
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@
 
 mod args;
 mod audio;
+mod bazecor;
 mod bench;
 mod layout;
 mod level;
@@ -33,13 +34,13 @@ use std::error::Error;
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audio::{verdict, AudioError, SourceKind, Verdict};
-use link::DygmaLink;
-use session::Session;
+use link::{DygmaLink, Link};
+use session::{Baseline, Session};
 use theme::{Frame, Rgb};
 
 fn main() -> ExitCode {
@@ -533,55 +534,148 @@ impl Cadence {
     }
 }
 
-/// Runs the visualizer until interrupted: audio in, frames out, steady pace.
+/// How often to check whether Bazecor has taken the port while running.
+const BAZECOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often to look while waiting for the board or Bazecor to become available.
+const RETRY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Exponential backoff between reconnection attempts, capped so the daemon is not
+/// asleep for minutes after the board returns.
+struct Backoff {
+    next: Duration,
+}
+
+impl Backoff {
+    const FIRST: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+
+    /// The delay to wait before the next attempt, doubling up to the cap.
+    fn delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = (self.next * 2).min(Self::MAX);
+        delay
+    }
+
+    /// Resets after a successful connection, so the next loss retries promptly.
+    fn reset(&mut self) {
+        self.next = Self::FIRST;
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self { next: Self::FIRST }
+    }
+}
+
+/// Reports a fatal audio-stream error, if one has occurred.
 ///
-/// The audio source is resolved *before* the board is touched, so a failed
-/// capture leaves the keyboard alone rather than flashing it and restoring.
-fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
-    let selection = audio::choose(args.source.as_deref())?;
-    println!("source: {selection}");
+/// `run_frames` needs this rather than a concrete [`audio::Capture`] so a test can
+/// drive it without a sound card. Production impls delegate to the capture's own
+/// error slot.
+trait AudioHealth {
+    fn error(&self) -> Option<String>;
+}
 
-    let (sender, receiver) = mpsc::channel();
-    let capture = audio::start(&selection, sender)?;
-    println!(
-        "  {} channels at {} Hz — drive the board until Ctrl-C",
-        capture.channels, capture.sample_rate
-    );
+impl AudioHealth for audio::Capture {
+    fn error(&self) -> Option<String> {
+        self.take_error()
+    }
+}
 
+/// Why one run of the frame loop ended.
+#[derive(Debug)]
+enum Detach {
+    /// The user interrupted; the board should be restored.
+    Interrupted,
+    /// Bazecor took the port; it must be released without restoring.
+    Paused,
+    /// The port failed; the caller should reconnect.
+    Lost(String),
+}
+
+/// Opens the board, returning the session and the port name for the log.
+///
+/// `baseline` is the theme and mode from the first successful open. Passing it on
+/// a reconnect keeps the original safe: the board now shows our last frame in
+/// static mode, so re-reading would capture our own output.
+fn open_session(
+    args: &args::Args,
+    baseline: Option<Baseline>,
+) -> Result<(Session<DygmaLink>, String), Box<dyn Error>> {
     let device = match &args.port {
         Some(port) => DygmaLink::from_port(port)?,
         None => DygmaLink::discover()?,
     };
     let port_name = device.port_name().to_string();
-    let mut session = Session::open(device)?;
-    let count = session.led_count();
+    let session = Session::open_with(device, baseline)?;
+    Ok((session, port_name))
+}
 
-    let plan = spectrum::BandPlan::standard(capture.sample_rate, spectrum::FFT_SIZE);
-    let config = live::LiveConfig {
-        fps: args.fps,
-        channels: capture.channels as usize,
-    };
-    let mut visualizer = live::Live::new(config, plan, count, Instant::now());
-    println!(
-        "  port {port_name} — {count} LEDs, {} fps, {} bands",
-        visualizer.fps(),
-        visualizer.bands()
-    );
+/// Drains and discards the audio backlog so a long pause does not grow memory.
+fn discard_audio(receiver: &Receiver<audio::Block>) {
+    while receiver.try_recv().is_ok() {}
+}
 
-    let started = Instant::now();
-    let mut drain = Cadence::new(DRAIN_INTERVAL, started);
-    let mut probe = Cadence::new(PROBE_INTERVAL, started);
-    let mut report = Cadence::new(REPORT_INTERVAL, started);
+/// Waits out the backoff delay, returning true when interrupted.
+fn sleep_backoff(backoff: &mut Backoff, interrupted: &AtomicBool) -> bool {
+    let delay = backoff.delay();
+    session::sleep_unless_interrupted(delay, interrupted);
+    interrupted.load(Ordering::SeqCst)
+}
+
+/// A port failure: report it so the caller can reconnect.
+fn lost<E: std::fmt::Display>(error: E, acks: u64) -> Result<(Detach, u64), Box<dyn Error>> {
+    Ok((Detach::Lost(error.to_string()), acks))
+}
+
+/// Fails if the audio stream has died. Losing audio is fatal, unlike losing the board.
+fn check_audio(audio: &dyn AudioHealth, frames: u64) -> Result<(), Box<dyn Error>> {
+    match audio.error() {
+        Some(error) => {
+            Err(format!("audio stream stopped mid-set after {frames} frames: {error}").into())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Runs the frame loop until interrupted, Bazecor appears, or the port fails.
+///
+/// Returns the reason it stopped and how many acknowledgements were discarded.
+/// An audio-stream failure is returned as an error: losing the audio is fatal,
+/// unlike losing the board.
+fn run_frames<L: Link>(
+    session: &mut Session<L>,
+    visualizer: &mut live::Live,
+    receiver: &Receiver<audio::Block>,
+    audio: &dyn AudioHealth,
+    interrupted: &AtomicBool,
+) -> Result<(Detach, u64), Box<dyn Error>> {
+    let mut drain = Cadence::new(DRAIN_INTERVAL, Instant::now());
+    let mut probe = Cadence::new(PROBE_INTERVAL, Instant::now());
+    let mut report = Cadence::new(REPORT_INTERVAL, Instant::now());
+    let mut bazecor_check = Cadence::new(BAZECOR_INTERVAL, Instant::now());
     let mut acks = 0u64;
+
     while !interrupted.load(Ordering::SeqCst) {
         let now = Instant::now();
+        // Bazecor first: stop writing before it corrupts the command stream. The
+        // session must be released without restoring, because the board is no
+        // longer ours to paint.
+        if bazecor_check.due(now) && bazecor::running() {
+            return Ok((Detach::Paused, acks));
+        }
+
         // Drain every block in order so the analyzer's window stays contiguous;
         // only a multi-second stall trips the cap and drops the oldest whole
         // blocks. Draining to just the newest block would splice two moments of
         // audio together and click, which reads as strobing at the frame rate.
-        let (latest, dropped) = live::Live::drain(&receiver);
+        let (latest, dropped) = live::Live::drain(receiver);
         let frame = visualizer.step(latest.as_ref(), now, dropped);
-        session.write_frame(&frame)?;
+        if let Err(error) = session.write_frame(&frame) {
+            return lost(error, acks);
+        }
 
         // Pacing after the write, so the board's write time is absorbed by the
         // schedule instead of pushing every frame past its deadline. This may
@@ -599,12 +693,17 @@ fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Bo
 
         // Discard acknowledgements unconditionally, on a wall-clock cadence.
         if drain.due(now) {
-            acks += session.drain_acks()? as u64;
+            match session.drain_acks() {
+                Ok(count) => acks += count as u64,
+                Err(error) => return lost(error, acks),
+            }
         }
         // Prove the board is still answering, not just accepting writes. The
         // query drains first, so it also clears acknowledgements as a side effect.
         if probe.due(now) {
-            session.health_check()?;
+            if let Err(error) = session.health_check() {
+                return lost(error, acks);
+            }
         }
         // Report the rate over the last observation window, not an average that an
         // hour of healthy running would hide a recent slowdown behind.
@@ -622,45 +721,167 @@ fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Bo
             }
         }
 
-        if let Some(error) = capture.take_error() {
-            // A mid-set stream failure is not "no signal was ever heard" — that
-            // error means every sample was zero. Report the actual failure and
-            // let Session's Drop put the board back on the way out.
-            return Err(format!(
-                "audio stream stopped mid-set after {} frames: {error}",
-                visualizer.frames()
-            )
-            .into());
-        }
+        // A mid-set stream failure is not "no signal was ever heard" — that error
+        // means every sample was zero. Losing the audio is fatal, unlike losing the
+        // board.
+        check_audio(audio, visualizer.frames())?;
         session::sleep_unless_interrupted(wait, interrupted);
+    }
+    Ok((Detach::Interrupted, acks))
+}
+
+/// Runs the visualizer until interrupted: audio in, frames out, steady pace.
+///
+/// The audio source is resolved *before* the board is touched, so a failed
+/// capture leaves the keyboard alone rather than flashing it and restoring.
+///
+/// The board comes and goes: Bazecor may take the port, or the board may be
+/// unplugged. The audio pipeline stays up throughout; the outer loop waits and
+/// reopens the board when it is available again.
+fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    let selection = audio::choose(args.source.as_deref())?;
+    println!("source: {selection}");
+
+    let (sender, receiver) = mpsc::channel();
+    let capture = audio::start(&selection, sender)?;
+    println!(
+        "  {} channels at {} Hz — drive the board until Ctrl-C",
+        capture.channels, capture.sample_rate
+    );
+
+    let plan = spectrum::BandPlan::standard(capture.sample_rate, spectrum::FFT_SIZE);
+    let config = live::LiveConfig {
+        fps: args.fps,
+        channels: capture.channels as usize,
+    };
+
+    let started = Instant::now();
+    let mut backoff = Backoff::default();
+    // The theme and mode from the first successful open. A reconnect must restore
+    // this, not whatever the board shows now — after a pause that is our own frame.
+    let mut original: Option<Baseline> = None;
+    let mut total_frames = 0u64;
+    let mut total_acks = 0u64;
+    let mut total_blocks = 0u64;
+    let mut total_resyncs = 0u64;
+    let mut last_rate: Option<(u32, u32, f64)> = None;
+
+    while !interrupted.load(Ordering::SeqCst) {
+        // Bazecor owns the port. Pause writes rather than corrupt its command
+        // stream, keep the audio pipeline alive, and discard the backlog so a long
+        // pause does not grow memory.
+        if bazecor::running() {
+            println!("  Bazecor is running — pausing writes until it exits");
+            while bazecor::running() && !interrupted.load(Ordering::SeqCst) {
+                discard_audio(&receiver);
+                session::sleep_unless_interrupted(RETRY_POLL_INTERVAL, interrupted);
+                // An audio stream that dies during a pause is still fatal.
+                check_audio(&capture, total_frames)?;
+            }
+            if interrupted.load(Ordering::SeqCst) {
+                break;
+            }
+            println!("  Bazecor exited — resuming");
+        }
+
+        // Try to open the board. A failure means it is unplugged or the port is
+        // busy; keep the audio pipeline alive and retry with backoff.
+        let (mut session, port_name) = match open_session(args, original.clone()) {
+            Ok(opened) => {
+                backoff.reset();
+                // Remember the pre-startup baseline on the first open, and keep it
+                // across reconnects.
+                if original.is_none() {
+                    original = Some(opened.0.baseline().clone());
+                }
+                opened
+            }
+            Err(error) => {
+                println!("  board unavailable ({error}) — retrying");
+                discard_audio(&receiver);
+                if sleep_backoff(&mut backoff, interrupted) {
+                    break;
+                }
+                check_audio(&capture, total_frames)?;
+                continue;
+            }
+        };
+
+        let count = session.led_count();
+        let mut visualizer = live::Live::new(config, plan.clone(), count, Instant::now());
+        println!(
+            "  port {port_name} — {count} LEDs, {} fps, {} bands",
+            visualizer.fps(),
+            visualizer.bands()
+        );
+
+        // Run frames until something detaches: the user, Bazecor, or the port.
+        let (detach, acks) = run_frames(
+            &mut session,
+            &mut visualizer,
+            &receiver,
+            &capture,
+            interrupted,
+        )?;
+        total_frames += visualizer.frames();
+        total_acks += acks;
+        total_blocks += visualizer.dropped_blocks();
+        total_resyncs += visualizer.resyncs();
+        last_rate = Some((
+            visualizer.fps(),
+            visualizer.target_fps(),
+            visualizer.achieved_fps(Instant::now()),
+        ));
+
+        match detach {
+            Detach::Interrupted => {
+                // A clean stop: restore the board. If the port is already gone the
+                // restore cannot succeed, but the user asked to stop, so report it
+                // and exit cleanly rather than tripping systemd's restart policy.
+                match session.restore() {
+                    Ok(()) => println!(
+                        "  restored LED mode {} ({})",
+                        session.baseline().mode.code(),
+                        session.baseline().mode.name()
+                    ),
+                    Err(error) => eprintln!("  could not restore the board: {error}"),
+                }
+                break;
+            }
+            Detach::Paused => {
+                // Bazecor owns the port now. Let go without writing the baseline
+                // into a device another program controls; the top of the loop waits
+                // for Bazecor to exit and reopens.
+                session.release();
+                // The top of the outer loop waits for Bazecor to exit.
+                continue;
+            }
+            Detach::Lost(error) => {
+                // The port failed. Dropping the session attempts a best-effort
+                // restore; back off before trying to reopen.
+                println!("  lost the board ({error}) — reconnecting");
+            }
+        }
+
+        if sleep_backoff(&mut backoff, interrupted) {
+            break;
+        }
+        check_audio(&capture, total_frames)?;
     }
 
     println!();
     let elapsed = started.elapsed();
     println!(
-        "  {} frames in {:.1}s — {:.1} fps achieved against a {} fps target",
-        visualizer.frames(),
-        elapsed.as_secs_f64(),
-        visualizer.achieved_fps(Instant::now()),
-        visualizer.target_fps()
+        "  {total_frames} frames in {:.1}s — {total_acks} acknowledgements discarded",
+        elapsed.as_secs_f64()
     );
-    if visualizer.fps() != visualizer.target_fps() {
-        println!(
-            "  ended at {} fps — the board could not sustain the target",
-            visualizer.fps()
-        );
+    if let Some((fps, target, achieved)) = last_rate {
+        println!("  {achieved:.1} fps achieved against a {target} fps target");
+        if fps != target {
+            println!("  ended at {fps} fps — the board could not sustain the target");
+        }
     }
-    println!(
-        "  {} blocks discarded after a stall, {acks} acknowledgements discarded, {} pacing resyncs",
-        visualizer.dropped_blocks(),
-        visualizer.resyncs()
-    );
-    session.restore()?;
-    println!(
-        "  restored LED mode {} ({})",
-        session.baseline().mode.code(),
-        session.baseline().mode.name()
-    );
+    println!("  {total_blocks} blocks discarded after a stall, {total_resyncs} pacing resyncs");
     Ok(())
 }
 
@@ -677,4 +898,104 @@ fn install_interrupt_handler(what: &'static str) -> Result<Arc<AtomicBool>, Box<
         eprintln!("\ninterrupted — {what}, Ctrl-C again to abort");
     })?;
     Ok(interrupted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_up_to_the_cap() {
+        let mut backoff = Backoff::default();
+        assert_eq!(backoff.delay(), Duration::from_secs(1));
+        assert_eq!(backoff.delay(), Duration::from_secs(2));
+        assert_eq!(backoff.delay(), Duration::from_secs(4));
+        assert_eq!(backoff.delay(), Duration::from_secs(8));
+        assert_eq!(backoff.delay(), Duration::from_secs(16));
+        assert_eq!(backoff.delay(), Duration::from_secs(30), "capped");
+        assert_eq!(backoff.delay(), Duration::from_secs(30), "stays capped");
+    }
+
+    /// A healthy audio stream for tests that do not care about audio.
+    struct Healthy;
+    impl AudioHealth for Healthy {
+        fn error(&self) -> Option<String> {
+            None
+        }
+    }
+
+    /// A session over a fake link that opens cleanly then fails on the frame write.
+    fn dead_port_session() -> Session<crate::testing::FakeLink> {
+        let theme_reply = theme::encode_theme(&theme::uniform(4, Rgb::new(10, 20, 30)))
+            .trim_start_matches("led.theme ")
+            .to_string();
+        let mut link = crate::testing::FakeLink::with_replies(&[
+            ("led.mode", "1 \r\n"),
+            ("led.theme", &theme_reply),
+        ]);
+        // The open sends three commands; the fourth — the first frame — fails.
+        link.fail_after = Some(3);
+        Session::open(link).expect("the fake opens")
+    }
+
+    fn test_visualizer() -> live::Live {
+        live::Live::new(
+            live::LiveConfig::default(),
+            spectrum::BandPlan::standard(48_000, spectrum::FFT_SIZE),
+            4,
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn run_frames_reports_a_lost_port() {
+        let mut session = dead_port_session();
+        let mut visualizer = test_visualizer();
+        let (_sender, receiver) = mpsc::channel();
+        let (detach, _acks) = run_frames(
+            &mut session,
+            &mut visualizer,
+            &receiver,
+            &Healthy,
+            &AtomicBool::new(false),
+        )
+        .expect("a dead port is not an audio error");
+        assert!(
+            matches!(detach, Detach::Lost(_)),
+            "a dead port must detach as Lost, got {detach:?}"
+        );
+    }
+
+    #[test]
+    fn run_frames_stops_when_interrupted() {
+        let mut session = dead_port_session();
+        let mut visualizer = test_visualizer();
+        let (_sender, receiver) = mpsc::channel();
+        let interrupted = AtomicBool::new(true);
+        let (detach, _acks) = run_frames(
+            &mut session,
+            &mut visualizer,
+            &receiver,
+            &Healthy,
+            &interrupted,
+        )
+        .unwrap();
+        assert!(
+            matches!(detach, Detach::Interrupted),
+            "an already-set flag must detach as Interrupted"
+        );
+    }
+
+    #[test]
+    fn a_successful_connection_resets_the_backoff() {
+        let mut backoff = Backoff::default();
+        backoff.delay();
+        backoff.delay();
+        backoff.reset();
+        assert_eq!(
+            backoff.delay(),
+            Duration::from_secs(1),
+            "a reconnect must retry promptly, not at the capped delay"
+        );
+    }
 }

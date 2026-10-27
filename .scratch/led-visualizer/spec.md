@@ -15,7 +15,7 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | Area | Decision | Reference |
 |---|---|---|
 | Transport | `led.theme` full RGB frame per update, ~1.6 KB; never `palette`/`colormap.map` (EEPROM wear) | ADR-0001 |
-| Port | Exclusive ownership; Bazecor closed; keep running and retry while busy/unplugged | ADR-0002 |
+| Port | Exclusive ownership; keep running and retry while busy/unplugged; release without restoring when Bazecor takes over | ADR-0002, ticket 08 |
 | Bazecor | Detected by process check at startup and before each retry; no writing while present (there is no OS lock to rely on) | ADR-0002 |
 | Serial stack | `dygma_focus` for discovery and mode vocabulary; `serialport` for I/O so acknowledgements can be drained | — |
 | Ack drain | Discard buffered replies on a 250 ms wall-clock cadence; the board acks every command including frames | ticket 07 |
@@ -31,7 +31,7 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | Colour | Continuous dark→hot perceptual ramp (black → red → orange → white) | — |
 | Thumbs | Per-channel level glow per half; white flash on bass onset | — |
 | Rate | 30 fps target; measured ceiling 69.5 fps, adaptive downward — floor 5 fps, step a sixth of the target, two resyncs or <90% achieved in a 2 s window to degrade, 6 s clean to recover; the budget is typing latency, not the wire | ticket 07 |
-| Lifecycle | Read baseline theme at startup, write it back on clean exit | — |
+| Lifecycle | Read baseline theme at startup, write it back on clean exit; on SIGTERM/SIGINT restore and exit cleanly; systemd user unit at login with `Restart=on-failure` so its policy does not fight the daemon's internal retry | ticket 08 |
 | Config | XDG TOML at `~/.config/dygmarave/config.toml`, CLI overrides | — |
 | Discovery | `/dev/serial/by-id` match on Dygma VID/PID, explicit path override | — |
 | Scope | `cargo run` + systemd **user** unit, Linux only | — |
@@ -47,7 +47,7 @@ Six modules, each with a narrow interface:
 - `analysis` — windowed FFT, 28 log-spaced bands per channel, AGC, attack/decay, gate, bass onset detection. Pure function of audio blocks → `Frame` values.
 - `render` — `Frame` → 131-entry RGB map. Owns the ramp, the band→LED table (snake + mirror), thumbs and the beat flash.
 - `config` — TOML load, CLI override, validation/defaults.
-- `main`/`daemon` — wiring, 30 fps pacing loop, adaptive rate, retry/backoff, signal handling, baseline restore.
+- `main`/`daemon` — wiring, 30 fps pacing loop, adaptive rate, retry/backoff, Bazecor pause, signal handling, baseline restore. The outer loop keeps the audio pipeline alive across port loss and Bazecor; the inner loop writes frames until interrupted, Bazecor appears, or the port fails.
 
 Data flow:
 
@@ -138,7 +138,7 @@ Measured on 2026-10-27 against a wired ANSI Raise, firmware `v1.0.12-beta b3df55
 
 - **Index→key table** must be built by correlating the runtime LED order against `RaiseANSIColorMap.png`; no machine-readable table exists upstream. Ticket 04.
 - **Ack-drain cadence** is now wall-clock based in ticket 07 (every 250 ms), and the health probe queries every 10 s. A real-board soak is still needed to prove the port never stalls over an hour-long show.
-- **Per-sink capture and sink suspension** need reconnect handling before the daemon can run unattended; ticket 08 owns it, and ticket 05 should prefer `sink_default` for stability.
+- **Per-sink capture and sink suspension** — ticket 05 prefers `sink_default`, which stays healthy when idle sinks suspend. A per-sink node still needs its own reconnect handling; ticket 08's port-level retry covers the board, not the audio node.
 
 ## Risks
 
