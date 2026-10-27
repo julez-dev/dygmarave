@@ -1,9 +1,9 @@
 //! Turning samples into per-channel band energies.
 //!
 //! A window of samples per channel is Hann-windowed, transformed, and folded into
-//! log-spaced bands. The output is a plain [`Spectrum`] of amplitudes that knows
-//! nothing about keyboards or terminals, so the renderer can be built and tested
-//! without a device attached.
+//! log-spaced bands. The output is a plain [`Spectrum`] of band energies that
+//! knows nothing about keyboards or terminals, so the renderer can be built and
+//! tested without a device attached.
 //!
 //! Two details are load-bearing:
 //!
@@ -21,7 +21,11 @@ use realfft::{RealFftPlanner, RealToComplex};
 /// The analysis window, ~21 ms at 48 kHz. Short enough to follow transients.
 pub const FFT_SIZE: usize = 1024;
 
-/// Bands per half. Matches the 28 matrix keys of one Dygma Raise half.
+/// Bands per half.
+///
+/// 28 because a Raise half has 28 matrix keys — the renderer decides that; this
+/// module only produces this many bands. It is a constant rather than a device
+/// fact so nothing here depends on a keyboard existing.
 pub const BAND_COUNT: usize = 28;
 
 /// Lowest band edge. Below this is mostly rumble and DC leakage.
@@ -37,6 +41,10 @@ pub const HIGH_HZ: f32 = 16_000.0;
 /// full-scale sine read 1.0 instead of 1.22.
 const HANN_POWER_CORRECTION: f32 = 1.5;
 
+/// How far below Nyquist the highest band edge is kept: a band touching Nyquist
+/// would be half-dead, since the top bin has no partner.
+const NYQUIST_MARGIN: f32 = 0.98;
+
 /// Band edges and the geometry needed to fold bins into them.
 #[derive(Debug, Clone)]
 pub struct BandPlan {
@@ -47,9 +55,19 @@ pub struct BandPlan {
 
 impl BandPlan {
     /// Builds `bands` log-spaced bands between `low_hz` and `high_hz`.
+    ///
+    /// The top is pulled below Nyquist when the sample rate cannot represent it —
+    /// a Bluetooth headset call profile runs at 8 kHz — so no band is permanently
+    /// dead. All 28 bands simply span a narrower range on such a device.
     pub fn new(sample_rate: u32, fft_size: usize, bands: usize, low_hz: f32, high_hz: f32) -> Self {
         assert!(bands > 0, "a plan needs at least one band");
         assert!(low_hz > 0.0 && high_hz > low_hz, "band range must ascend");
+        let nyquist = sample_rate as f32 / 2.0;
+        let high_hz = high_hz.min(nyquist * NYQUIST_MARGIN);
+        assert!(
+            high_hz > low_hz,
+            "a {sample_rate} Hz sample rate cannot carry bands from {low_hz} Hz"
+        );
         let ratio = (high_hz / low_hz).powf(1.0 / bands as f32);
         let edges = (0..=bands)
             .map(|index| low_hz * ratio.powi(index as i32))
@@ -104,10 +122,12 @@ impl BandPlan {
     /// contributes a third to each instead of lighting all three fully.
     fn fold(&self, bin_power: &[f32], out: &mut [f32]) {
         let bin_hz = self.bin_hz();
-        for (bin, power) in bin_power.iter().enumerate() {
+        let top_hz = self.edges[self.band_count()];
+        let last_bin = ((top_hz / bin_hz).ceil() as usize + 1).min(bin_power.len());
+        for (bin, power) in bin_power.iter().enumerate().take(last_bin) {
             let bin_lo = bin as f32 * bin_hz;
             let bin_hi = bin_lo + bin_hz;
-            for (band, slot) in out.iter_mut().enumerate().take(self.band_count()) {
+            for (band, slot) in out.iter_mut().enumerate() {
                 let lo = self.edges[band];
                 let hi = self.edges[band + 1];
                 let overlap = bin_hi.min(hi) - bin_lo.max(lo);
@@ -119,10 +139,14 @@ impl BandPlan {
     }
 }
 
-/// One frame of band amplitudes per channel.
+/// The band energies of one analysis window, per channel.
 ///
-/// Linear amplitudes, not decibels: `1.0` is a full-scale sine, and the dynamics
-/// stage decides how to compress that into light.
+/// Linear, not decibels: `1.0` is a band at full scale, and the dynamics stage
+/// decides how to compress that into light. Nothing here is a keyboard, a colour
+/// or a terminal.
+///
+/// Deliberately *not* called a Frame: in this project's glossary a Frame is one
+/// complete colouring of the keyboard, which is the renderer's business.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spectrum {
     per_channel: Vec<Vec<f32>>,
@@ -157,7 +181,7 @@ impl Spectrum {
         self.per_channel[channel][band]
     }
 
-    /// The band carrying the most energy in a channel, and its amplitude.
+    /// The band carrying the most energy in a channel, and that energy.
     pub fn loudest_band(&self, channel: usize) -> (usize, f32) {
         self.per_channel[channel]
             .iter()
@@ -181,8 +205,15 @@ pub struct Analyzer {
     coherent_gain: f32,
     /// The most recent `fft_size` samples of each channel.
     pending: Vec<Vec<f32>>,
+    /// Samples that did not complete an interleaved frame, held for the next push.
+    ///
+    /// Dropping them would shift every later sample by one position and silently
+    /// swap the channels for the rest of the stream.
+    carry: Vec<f32>,
     input: Vec<f32>,
     output: Vec<Complex32>,
+    power: Vec<f32>,
+    spectrum: Spectrum,
 }
 
 impl Analyzer {
@@ -200,10 +231,14 @@ impl Analyzer {
             .collect();
         let coherent_gain = window.iter().sum::<f32>() / fft_size as f32;
 
+        let output = fft.make_output_vec();
         Self {
             pending: vec![Vec::with_capacity(fft_size * 2); channels],
+            carry: Vec::with_capacity(channels * 2),
+            power: vec![0.0; output.len()],
+            spectrum: Spectrum::new(channels, plan.band_count()),
             input: fft.make_input_vec(),
-            output: fft.make_output_vec(),
+            output,
             window,
             coherent_gain,
             plan,
@@ -223,18 +258,23 @@ impl Analyzer {
     }
 
     /// Appends interleaved samples, keeping only the most recent window.
+    ///
+    /// A block that does not end on a frame boundary leaves its last samples in
+    /// `carry`; they are prepended to the next block. Dropping them instead would
+    /// misalign every subsequent sample and swap the channels permanently.
     pub fn push_interleaved(&mut self, samples: &[f32]) {
         let channels = self.pending.len();
         if channels == 0 {
             return;
         }
-        let fft_size = self.plan.fft_size();
-        // Whole frames only: a partial trailing frame belongs to no channel.
-        for frame in samples.chunks_exact(channels) {
-            for (channel, sample) in frame.iter().enumerate() {
-                self.pending[channel].push(*sample);
-            }
+        if self.carry.is_empty() {
+            self.absorb_frames(samples, channels);
+        } else {
+            let mut joined = std::mem::take(&mut self.carry);
+            joined.extend_from_slice(samples);
+            self.absorb_frames(&joined, channels);
         }
+        let fft_size = self.plan.fft_size();
         for channel in &mut self.pending {
             if channel.len() > fft_size {
                 let excess = channel.len() - fft_size;
@@ -243,30 +283,54 @@ impl Analyzer {
         }
     }
 
+    fn absorb_frames(&mut self, samples: &[f32], channels: usize) {
+        let mut frames = samples.chunks_exact(channels);
+        for frame in &mut frames {
+            for (channel, sample) in frame.iter().enumerate() {
+                self.pending[channel].push(*sample);
+            }
+        }
+        self.carry.extend_from_slice(frames.remainder());
+    }
+
     /// Computes the spectrum of the most recent window, if one is ready.
-    pub fn spectrum(&mut self) -> Option<Spectrum> {
+    ///
+    /// Reuses one buffer, so calling this every display frame allocates nothing.
+    pub fn spectrum(&mut self) -> Option<&Spectrum> {
         if !self.is_ready() {
             return None;
         }
-        let bands = self.plan.band_count();
-        let mut spectrum = Spectrum::new(self.pending.len(), bands);
-        let bin_scale = 2.0 / (self.plan.fft_size() as f32 * self.coherent_gain);
-        let mut power = vec![0.0f32; self.output.len()];
+        let Self {
+            plan,
+            fft,
+            window,
+            coherent_gain,
+            pending,
+            input,
+            output,
+            power,
+            spectrum,
+            ..
+        } = self;
 
-        for (channel_index, samples) in self.pending.iter().enumerate() {
+        let bin_scale = 2.0 / (plan.fft_size() as f32 * *coherent_gain);
+        for channel in &mut spectrum.per_channel {
+            channel.fill(0.0);
+        }
+
+        for (channel_index, samples) in pending.iter().enumerate() {
             for (index, sample) in samples.iter().enumerate() {
-                self.input[index] = sample * self.window[index];
+                input[index] = sample * window[index];
             }
-            if self.fft.process(&mut self.input, &mut self.output).is_err() {
+            if fft.process(input, output).is_err() {
                 return None;
             }
-            // A real sine of amplitude A peaks at A after this scaling.
-            for (bin, value) in self.output.iter().enumerate() {
+            // A full-scale sine in a bin reads as energy 1.0 after this scaling.
+            for (bin, value) in output.iter().enumerate() {
                 let amplitude = value.norm() * bin_scale;
                 power[bin] = amplitude * amplitude;
             }
-            self.plan
-                .fold(&power, &mut spectrum.per_channel[channel_index]);
+            plan.fold(power, &mut spectrum.per_channel[channel_index]);
             for band in &mut spectrum.per_channel[channel_index] {
                 *band = (*band / HANN_POWER_CORRECTION).sqrt();
             }
@@ -289,7 +353,10 @@ mod tests {
     fn spectrum_of(sine: &[f32], channels: usize) -> Spectrum {
         let mut analyzer = analyzer(channels);
         analyzer.push_interleaved(sine);
-        analyzer.spectrum().expect("a full window was pushed")
+        analyzer
+            .spectrum()
+            .expect("a full window was pushed")
+            .clone()
     }
 
     fn sine(freq: f32, amplitude: f32, samples: usize) -> Vec<f32> {
@@ -426,11 +493,56 @@ mod tests {
     }
 
     #[test]
-    fn a_view_of_the_spectrum_is_device_free() {
-        // The type exposes only channels and bands: no keyboard concepts.
+    fn a_spectrum_reports_one_band_set_per_channel() {
         let spectrum = spectrum_of(&sine(440.0, 0.5, FFT_SIZE * 2), 2);
         assert_eq!(spectrum.channel_count(), 2);
         assert_eq!(spectrum.band_count(), BAND_COUNT);
         assert_eq!(spectrum.band(0, 0), spectrum.bands(0)[0]);
+    }
+
+    #[test]
+    fn a_block_that_does_not_end_on_a_frame_boundary_does_not_swap_channels() {
+        // 101 is odd, so the first block splits a stereo frame. Dropping the
+        // leftover sample would shift everything and put the tone in the right
+        // channel instead of the left.
+        let mut interleaved = Vec::new();
+        for sample in sine(1_000.0, 0.5, FFT_SIZE * 2) {
+            interleaved.push(sample);
+            interleaved.push(0.0);
+        }
+        let mut analyzer = analyzer(2);
+        for block in interleaved.chunks(101) {
+            analyzer.push_interleaved(block);
+        }
+        let spectrum = analyzer.spectrum().expect("a window was collected");
+        assert!(
+            spectrum.loudest_band(0).1 > 0.4,
+            "the tone belongs to the left channel"
+        );
+        assert!(
+            spectrum.bands(1).iter().all(|energy| *energy < 1e-3),
+            "right channel must stay silent, got {:?}",
+            spectrum.bands(1)
+        );
+    }
+
+    #[test]
+    fn bands_stay_below_nyquist_on_a_low_rate_device() {
+        // An 8 kHz call profile cannot carry 16 kHz, so the top edge is pulled in
+        // rather than leaving the upper bands permanently dark.
+        let plan = BandPlan::new(8_000, FFT_SIZE, BAND_COUNT, LOW_HZ, HIGH_HZ);
+        let top = plan.edges()[plan.band_count()];
+        assert!(top < 4_000.0, "top band at {top} Hz must be below Nyquist");
+        assert!(top > 3_000.0, "but not collapsed: {top} Hz");
+        // Spacing is still log, just over a narrower range.
+        let ratios: Vec<f32> = plan
+            .edges()
+            .windows(2)
+            .map(|pair| pair[1] / pair[0])
+            .collect();
+        let first = ratios[0];
+        for ratio in &ratios {
+            assert!((ratio - first).abs() < 1e-3);
+        }
     }
 }

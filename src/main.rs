@@ -1,13 +1,15 @@
 //! dygmarave — audio-reactive LEDs on a Dygma Raise.
 //!
-//! Two probes exist so far, one per half of the eventual pipeline:
+//! Three readouts exist so far, each covering one seam of the eventual pipeline:
 //!
 //! * the default `LED path` finds the board by USB identity, learns its LED count
 //!   from the board itself, holds a written frame long enough to prove no active
 //!   effect paints over it, measures full-frame throughput, and restores the
 //!   keyboard exactly as it was found (ticket 01);
 //! * `--probe-audio` captures the output mix and prints a live level meter,
-//!   refusing microphones (ticket 02).
+//!   refusing microphones (ticket 02);
+//! * `--probe-spectrum` prints 28 log-spaced band energies per channel, the
+//!   analysis the renderer will consume (ticket 03).
 
 mod args;
 mod audio;
@@ -162,9 +164,9 @@ enum Probe {
     },
     Spectrum {
         analyzer: Box<spectrum::Analyzer>,
-        /// Loudest band seen per channel, and its amplitude.
+        /// Loudest band seen per channel, and its energy.
         loudest: Vec<(usize, f32)>,
-        amplitude: f32,
+        peak_energy: f32,
     },
 }
 
@@ -183,7 +185,7 @@ impl Probe {
             Probe::Spectrum {
                 analyzer: Box::new(spectrum::Analyzer::new(plan, capture.channels as usize)),
                 loudest: vec![(0, 0.0); capture.channels as usize],
-                amplitude: 0.0,
+                peak_energy: 0.0,
             }
         } else {
             Probe::Level {
@@ -222,17 +224,17 @@ impl Probe {
             Probe::Spectrum {
                 analyzer,
                 loudest,
-                amplitude,
+                peak_energy,
             } => {
                 let spectrum = analyzer.spectrum()?;
                 for (channel, slot) in loudest.iter_mut().enumerate() {
                     let (band, level) = spectrum.loudest_band(channel);
-                    *amplitude = amplitude.max(level);
+                    *peak_energy = peak_energy.max(level);
                     if level >= slot.1 {
                         *slot = (band, level);
                     }
                 }
-                Some(render_bands(&spectrum))
+                Some(render_bands(spectrum))
             }
         }
     }
@@ -240,7 +242,7 @@ impl Probe {
     fn loudest(&self) -> f32 {
         match self {
             Probe::Level { loudest, .. } => *loudest,
-            Probe::Spectrum { amplitude, .. } => *amplitude,
+            Probe::Spectrum { peak_energy, .. } => *peak_energy,
         }
     }
 
@@ -297,8 +299,8 @@ fn render_bands(spectrum: &spectrum::Spectrum) -> String {
         .to_string()
 }
 
-/// Captures the output mix and prints a live readout, so the audio path can be
-/// checked before any DSP exists.
+/// Captures the output mix and prints a live readout, so the audio path and the
+/// analysis can be checked before the renderer exists.
 fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
     let selection = audio::choose(args.source.as_deref())?;
     println!(
