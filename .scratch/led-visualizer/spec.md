@@ -1,0 +1,137 @@
+# Dygmarave v1 — audio-reactive LEDs on a Dygma Raise
+
+Status: planned, not started. Decisions below are settled; facts marked **OPEN** are still being verified.
+
+## Goal
+
+A Linux daemon that reads the system's audio *output*, computes a spectrum, and paints it across the per-key RGB of a wired ANSI Dygma Raise in real time.
+
+Non-goals for v1: Windows/macOS, microphone input, GUI or tray app, distro packaging, Raise 2 / Defy / wireless support, custom firmware.
+
+Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/issues/`, numbered in dependency order. Start at 01 and work the frontier.
+
+## Settled decisions
+
+| Area | Decision | Reference |
+|---|---|---|
+| Transport | `led.theme` full RGB frame per update, ~1.6 KB; never `palette`/`colormap.map` (EEPROM wear) | ADR-0001 |
+| Port | Exclusive ownership; Bazecor closed; keep running and retry while busy/unplugged | ADR-0002 |
+| Bazecor | Detected by process check at startup and before each retry; no writing while present (there is no OS lock to rely on) | ADR-0002 |
+| Serial stack | `dygma_focus` for discovery and mode vocabulary; `serialport` for I/O so acknowledgements can be drained | — |
+| Ack drain | Discard buffered replies every 64 frames; the board acks every command including frames | — |
+| LED count | Queried every startup by counting `led.theme` triples; measured 132, of which indices 20 and 131 ignore writes | — |
+| LED mode | Query current mode, switch to a static non-repainting one, restore on exit (mode is EEPROM-persisted) | — |
+| Frame write | Fire-and-forget, no per-frame terminator wait; a periodic health probe catches a dead port | — |
+| Bands | 28 per half, 56 total; snake sequence; right half mirrored, bass at inner edges | ADR-0003 |
+| Audio | System output only, PulseAudio/PipeWire monitor source via `cpal` | — |
+| Analysis | 1024-sample window (≈21 ms at 48 kHz), log-spaced 40 Hz–16 kHz | — |
+| Dynamics | Instant attack, slow exponential decay, per-band AGC, gate to black on silence | — |
+| Colour | Continuous dark→hot perceptual ramp (black → red → orange → white) | — |
+| Thumbs | Per-channel level glow per half; white flash on bass onset | — |
+| Rate | 30 fps target; measured ceiling 69.5 fps, adaptive downward; the budget is typing latency, not the wire | — |
+| Lifecycle | Read baseline theme at startup, write it back on clean exit | — |
+| Config | XDG TOML at `~/.config/dygmarave/config.toml`, CLI overrides | — |
+| Discovery | `/dev/serial/by-id` match on Dygma VID/PID, explicit path override | — |
+| Scope | `cargo run` + systemd **user** unit, Linux only | — |
+
+Vocabulary is defined in `/GLOSSARY.md`.
+
+## Architecture
+
+Six modules, each with a narrow interface:
+
+- `device` — discovery (VID/PID `1209:2200`/`1209:2201` or explicit path), Bazecor presence check, mode query/switch/restore, LED-count query, frame write, baseline read/restore. Knows the wire format, nothing about audio.
+- `audio` — capture from a monitor source, emit fixed-size f32 blocks with a sample rate. Knows nothing about LEDs.
+- `analysis` — windowed FFT, 28 log-spaced bands per channel, AGC, attack/decay, gate, bass onset detection. Pure function of audio blocks → `Frame` values.
+- `render` — `Frame` → 131-entry RGB map. Owns the ramp, the band→LED table (snake + mirror), thumbs and the beat flash.
+- `config` — TOML load, CLI override, validation/defaults.
+- `main`/`daemon` — wiring, 30 fps pacing loop, adaptive rate, retry/backoff, signal handling, baseline restore.
+
+Data flow:
+
+```
+monitor source → [audio] → blocks → [analysis] → Frame{bands[2][28], level[2], beat:bool}
+                                                        ↓
+                                            [render] → [u8; 3 * 131]
+                                                        ↓
+                                             [device] → led.theme …\n
+```
+
+Three hard constraints inherited from the firmware:
+
+1. `palette`, `colormap.map`, `keymap.*` and `led.brightness` are EEPROM-backed. `led.theme` is RAM-only — the THEME handler in `LEDControl.cpp` calls `setCrgbAt()` and nothing else. The frame loop may only emit `led.theme`.
+2. The wire format is **plain-text, space-separated decimal, not JSON**: `led.theme R G B R G B …\n`, one triplet per LED index. Responses are terminated by a line containing only `.`.
+3. An **active LED mode repaints every main-loop cycle** and overwrites whatever `led.theme` drew. The daemon must select a non-repainting mode before its first frame, and restore the previous mode on exit.
+
+## Config sketch
+
+```toml
+[device]
+port = "auto"            # or /dev/serial/by-id/...
+
+[audio]
+source = ""              # empty = default sink's monitor
+
+[analysis]
+window = 1024
+band_min_hz = 40.0
+band_max_hz = 16000.0
+
+[render]
+fps_target = 30
+attack = "instant"
+decay_ms = 180
+gate_db = -55.0
+agc_release_ms = 4000
+
+[thumbs]
+level = true
+beat_flash = true
+beat_threshold = 2.0     # multiple of rolling average energy
+```
+
+## Prior art
+
+Worth copying rather than inventing: OpenRGB's `DygmaRaiseController` (C++) drives all LEDs through bulk `led.theme` writes, fire-and-forget without reading the `.` terminator, and closes the port on teardown. Paired with KeyboardVisualizer it already forms an audio-reactive pipeline on this board — so the risk in this project is the DSP and lifecycle, not the transport. In Rust, the `dygma_focus` crate (v0.5.1) wraps discovery and most Focus commands, but has no `led.theme` helper, so the hot path may still need raw writes. No Rust Dygma audio visualizer exists.
+
+## Milestones
+
+**M1 — Vertical slice.** Open the port, query the LED count and current mode, switch to a static mode, read the baseline theme, write a solid colour, then measure how many full `led.theme` frames per second the wire and firmware actually sustain. Proves the riskiest assumption — ADR-0001's per-frame cost and the spec's 30 fps target — before any DSP exists. Also settles 131-vs-132 on the real board. If the measured rate lands near the low end of the 10–40 fps estimate, this is the moment to revisit, not after six modules are built.
+
+**M2 — Audio pipeline.** Capture the monitor source, window and FFT it, fold into 28 log-spaced bands per channel. Verify by dumping band energies to stdout while playing known tones.
+
+**M3 — Mapping.** Build the band→LED-index table for the ANSI Raise (snake, mirrored halves) and render a static gradient across the board to confirm geometry visually.
+
+**M4 — Dynamics and colour.** AGC, attack/decay, gate, ramp, thumb level and beat flash. Tune by ear and eye against real music.
+
+**M5 — Lifecycle.** Retry/backoff on busy or missing port, baseline restore on exit and on SIGTERM, systemd user unit, config file with validation.
+
+## Facts — measured on hardware
+
+Measured on 2026-10-27 against a wired ANSI Raise, firmware `v1.0.12-beta b3df553c f71f7f9`, by ticket 01's tool.
+
+- **132 LEDs.** A bare `led.theme` returns 396 values, so OpenRGB's figure was right and Dygma's doc (131) was wrong. Still queried at runtime rather than hardcoded: `Cargo.toml`'s count is whatever the board says.
+- **Two indices never accept a theme colour: 20 and 131.** They remain black through a solid-colour write and through restore. Both are black in the stock baseline, so nothing is lost, but a renderer that assumes 132 writable LEDs is wrong, and a naive "did the frame land" check would fail forever.
+- **Throughput is 69.5 fps** for full 1330-byte frames, 14.4 ms per frame, 90 KiB/s — steady over a 20-second soak. The research estimate of 10–40 fps was too pessimistic. The 30 fps target has ~2.3× headroom, so it stays where it is: fps is now limited by the latency budget, not the wire.
+- **Waiting for the ack costs half the rate.** Request/response per frame measured 38 fps (26 ms/frame) versus 69.5 fire-and-forget. Fire-and-forget is confirmed, not assumed.
+- **The board acks every command, frames included** — one `\r\n.\r\n` per frame, ≈1.2 KB/s at full rate. Unread, they fill the kernel buffer and stall the firmware. Ticket 01 drains every 64 frames.
+- **`led.mode` values are 0–3, and only 0 is static.** Measured: mode 0 holds a written frame indefinitely; 1 (rainbow), 2 (cycle) and 3 (stalker) paint over it within a second; 4 and above are rejected by the firmware (which contradicts the `dygma_focus` enum, which lists Red/Green/Blue as 4–6).
+- **`dygma_focus` cannot implement the hot path.** It hard-codes a 5 s read timeout and keeps its port private, so acknowledgements can neither be peeked nor discarded; a read after any fire-and-forget frame returns a stale ack. Discovery and the mode vocabulary still come from it.
+- **`cpal` 0.18.x has native PipeWire/PulseAudio backends** (host priority PipeWire > PulseAudio > ALSA). The classic failure is real: a monitor is a source, not an ALSA PCM, so the ALSA-only path **silently captures the microphone instead**. Use the native backend, and assert a non-zero peak before trusting the stream.
+- **No OS-level exclusive lock exists.** Neither Bazecor nor `dygma_focus` requests one (`set_exclusive(false)`), so a busy port never raises `EBUSY` and the retry path cannot detect Bazecor on its own — hence the process check.
+
+## Known open items
+
+- **Index→key table** must be built by correlating the runtime LED order against `RaiseANSIColorMap.png`; no machine-readable table exists upstream. Ticket 04.
+- **Ack-drain cadence** is a stopgap in ticket 01 (every 64 frames). Ticket 07 owns making it adaptive and proving the port never stalls over a long show.
+- **Audio path** facts above are still from documentation, not measurement; ticket 02 confirms them on this machine.
+
+## Risks
+
+- **Firmware parser throughput.** ~396 decimal integers per frame is the dominant cost, and `syncLeds()` sends each half's data four times. Measured headroom is comfortable (69.5 fps against a 30 fps target), so this is no longer a rate risk — the remaining rate risk is typing latency, below.
+- **Unread acknowledgements.** The board replies to every command, including every frame. Without periodic draining the kernel buffer fills and the firmware stalls mid-show — silent until it freezes. Ticket 01 drains in the benchmark; ticket 07 must make it unconditional in the render loop.
+- **Typing latency.** Dygma's own issue tracker reports LED effects substantially increasing key-to-USB latency (Keyboardio measured 9–14 ms under a heavy LED effect). This daemon writes continuously, so it will cost typing latency; that is a known price of the feature, not a bug to chase.
+- **EEPROM wear.** Any accidental use of an EEPROM-backed command in the frame loop. Mitigated by routing all writes through one function and never exposing the others.
+- **USB autosuspend / replug.** Port may vanish mid-show; retry loop must reconstruct state, including re-reading the baseline theme.
+- **AGC pumping.** Per-band AGC can amplify the noise floor in quiet passages; the gate is the mitigation and `agc_release_ms` the tuning knob.
+- **Wrong audio source.** Silently capturing the microphone instead of the sink's monitor is the single most likely "it runs but shows the wrong thing" failure.
