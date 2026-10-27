@@ -15,6 +15,12 @@ pub struct Args {
     pub hold_ms: u64,
     /// How many frames to write when measuring throughput.
     pub frames: u32,
+    /// Probe the audio path instead of the LED path.
+    pub probe_audio: bool,
+    /// How long to probe audio for.
+    pub seconds: u64,
+    /// Capture device to use instead of choosing one.
+    pub source: Option<String>,
     pub help: bool,
 }
 
@@ -25,6 +31,9 @@ impl Default for Args {
             colour: Rgb::new(32, 96, 255),
             hold_ms: 3_000,
             frames: 120,
+            probe_audio: false,
+            seconds: 5,
+            source: None,
             help: false,
         }
     }
@@ -40,7 +49,13 @@ Options:
   --colour <R,G,B>    colour to paint and measure with (default 32,96,255)
   --hold-ms <MS>      hold the colour this long before checking it (default 3000)
   --frames <N>        frames to write when measuring (default 120)
+  --probe-audio       probe the audio path instead of the LED path
+  --seconds <N>       how long to probe audio for (default 5)
+  --source <ID>       capture this device instead of choosing a monitor
   -h, --help          show this help
+
+With --probe-audio, the default sink's monitor is captured (never the
+microphone) and a live level meter is printed, failing if no signal arrives.
 
 The board is found by USB identity, not by a fixed port name. The LED count is
 read from the board itself. The baseline theme and LED mode are restored on exit
@@ -74,6 +89,14 @@ where
                 let value = next_value(&mut args, &flag)?;
                 parsed.colour = parse_colour(&value)?;
             }
+            "--probe-audio" => parsed.probe_audio = true,
+            "--seconds" => {
+                let value = next_value(&mut args, &flag)?;
+                parsed.seconds = value
+                    .parse()
+                    .map_err(|_| format!("--seconds expects a whole number, got {value:?}"))?;
+            }
+            "--source" => parsed.source = Some(next_value(&mut args, &flag)?),
             other => return Err(format!("unknown argument {other:?} (try --help)")),
         }
     }
@@ -159,6 +182,28 @@ mod tests {
     #[test]
     fn rejects_a_flag_missing_its_value() {
         assert!(args(&["--port"]).unwrap_err().contains("expects a value"));
+    }
+
+    #[test]
+    fn parses_the_audio_probe_flags() {
+        let parsed = args(&["--probe-audio", "--seconds", "2", "--source", "pipewire:42"]).unwrap();
+        assert!(parsed.probe_audio);
+        assert_eq!(parsed.seconds, 2);
+        assert_eq!(parsed.source.as_deref(), Some("pipewire:42"));
+    }
+
+    #[test]
+    fn audio_probe_defaults_to_five_seconds_of_choosing_for_itself() {
+        let parsed = args(&["--probe-audio"]).unwrap();
+        assert_eq!(parsed.seconds, 5);
+        assert_eq!(parsed.source, None);
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_duration() {
+        assert!(args(&["--seconds", "soon"])
+            .unwrap_err()
+            .contains("--seconds"));
     }
 
     #[test]

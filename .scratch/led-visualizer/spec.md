@@ -117,14 +117,16 @@ Measured on 2026-10-27 against a wired ANSI Raise, firmware `v1.0.12-beta b3df55
 - **The board acks every command, frames included** — one `\r\n.\r\n` per frame, ≈1.2 KB/s at full rate. Unread, they fill the kernel buffer and stall the firmware. Ticket 01 drains every 64 frames.
 - **`led.mode` values are 0–3, and only 0 is static.** Measured: mode 0 holds a written frame indefinitely; 1 (rainbow), 2 (cycle) and 3 (stalker) paint over it within a second; 4 and above are rejected by the firmware (which contradicts the `dygma_focus` enum, which lists Red/Green/Blue as 4–6).
 - **`dygma_focus` cannot implement the hot path.** It hard-codes a 5 s read timeout and keeps its port private, so acknowledgements can neither be peeked nor discarded; a read after any fire-and-forget frame returns a stale ack. Discovery and the mode vocabulary still come from it.
-- **`cpal` 0.18.x has native PipeWire/PulseAudio backends** (host priority PipeWire > PulseAudio > ALSA). The classic failure is real: a monitor is a source, not an ALSA PCM, so the ALSA-only path **silently captures the microphone instead**. Use the native backend, and assert a non-zero peak before trusting the stream.
+- **The predicted audio failure is real on this machine.** `pactl` reports the default *sink* as the USB speakers and the default *source* as the Auna CM900 microphone, so opening the default input would visualize the room. Measured: cpal's PipeWire host offers `pipewire:sink_default` (the default sink's monitor, which follows the user's output choice), every sink as a capturable node, `pipewire:input_default` (the microphone), and the hardware inputs. `cpal` 0.18 needs `--no-default-features --features pipewire,pulseaudio`; the ALSA path can only reach the microphone.
+- **Capturing a specific sink node dies when that sink suspends.** Measuring an idle HDMI sink produced "Device disconnected" on the stream while `sink_default` stayed healthy, because PipeWire suspends idle nodes. Anything that pins one sink needs reconnect handling (ticket 08).
+- **Channel separation is correct end to end.** A 440 Hz tone written to the left channel only measured **L −10.5 dBFS, R −100.0 dBFS** through the monitor, so the interleaved-sample maths can be trusted for per-half colours.
 - **No OS-level exclusive lock exists.** Neither Bazecor nor `dygma_focus` requests one (`set_exclusive(false)`), so a busy port never raises `EBUSY` and the retry path cannot detect Bazecor on its own — hence the process check.
 
 ## Known open items
 
 - **Index→key table** must be built by correlating the runtime LED order against `RaiseANSIColorMap.png`; no machine-readable table exists upstream. Ticket 04.
 - **Ack-drain cadence** is a stopgap in ticket 01 (every 64 frames). Ticket 07 owns making it adaptive and proving the port never stalls over a long show.
-- **Audio path** facts above are still from documentation, not measurement; ticket 02 confirms them on this machine.
+- **Per-sink capture and sink suspension** need reconnect handling before the daemon can run unattended; ticket 08 owns it, and ticket 05 should prefer `sink_default` for stability.
 
 ## Risks
 

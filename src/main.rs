@@ -6,7 +6,9 @@
 //! sustains, and put the keyboard back exactly as it was found.
 
 mod args;
+mod audio;
 mod bench;
+mod level;
 mod link;
 mod session;
 mod theme;
@@ -15,11 +17,14 @@ mod theme;
 mod testing;
 
 use std::error::Error;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use audio::{AudioError, SourceKind};
 use link::DygmaLink;
 use session::Session;
 use theme::{Frame, Rgb};
@@ -42,6 +47,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let interrupted = install_interrupt_handler()?;
+
+    if args.probe_audio {
+        return probe_audio(&args, &interrupted);
+    }
 
     let device = match &args.port {
         Some(port) => DygmaLink::from_port(port)?,
@@ -131,6 +140,102 @@ fn run() -> Result<(), Box<dyn Error>> {
         "\nrestored baseline theme and LED mode {} ({})",
         session.baseline().mode.code(),
         session.baseline().mode.name()
+    );
+    Ok(())
+}
+
+/// Captures the output mix and prints a live level meter, so the audio path can
+/// be checked before any DSP exists.
+fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    let selection = audio::choose(args.source.as_deref())?;
+    println!(
+        "source: {selection}{}",
+        if selection.follows_default_sink() {
+            " — follows the default sink"
+        } else {
+            ""
+        }
+    );
+    if selection.kind == SourceKind::Unknown {
+        println!("  note: this device is not recognisable as a monitor; capturing it because you named it");
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let capture = audio::start(&selection, sender)?;
+    println!(
+        "  {} channels at {} Hz, {:?}",
+        capture.channels, capture.sample_rate, capture.sample_format
+    );
+    println!("  listening for {} s — play something…", args.seconds);
+
+    let deadline = Instant::now() + Duration::from_secs(args.seconds);
+    let mut loudest = 0.0f32;
+    let mut held = vec![0.0f32; capture.channels as usize];
+    let mut window: Vec<f32> = Vec::new();
+    let mut last_draw = Instant::now();
+    // A live meter redraws in place, but a journal or a pipe gets one line a
+    // second instead of a wall of carriage returns.
+    let interactive = std::io::stdout().is_terminal();
+    let redraw_every = if interactive {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_secs(1)
+    };
+
+    while Instant::now() < deadline && !interrupted.load(Ordering::SeqCst) {
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(block) => window.extend_from_slice(&block.samples),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if last_draw.elapsed() < redraw_every {
+            continue;
+        }
+        if let Some(levels) = level::measure(&window, capture.channels) {
+            loudest = loudest.max(levels.loudest());
+            for (index, peak) in levels.peak.iter().enumerate() {
+                if let Some(slot) = held.get_mut(index) {
+                    *slot = slot.max(*peak);
+                }
+            }
+            if interactive {
+                print!("\r{}    ", level::meter_line(&levels));
+            } else {
+                println!("{}", level::meter_line(&levels));
+            }
+            std::io::stdout().flush()?;
+        }
+        window.clear();
+        last_draw = Instant::now();
+    }
+    if interactive {
+        println!();
+    }
+    let stream_error = capture.take_error();
+
+    if loudest <= 0.0 {
+        if let Some(error) = stream_error {
+            println!("  stream stopped: {error}");
+        }
+        return Err(AudioError::NoSignal {
+            selection: Box::new(selection),
+        }
+        .into());
+    }
+    if let Some(error) = stream_error {
+        println!("  note: the stream reported an error: {error}");
+    }
+    for (index, peak) in held.iter().enumerate() {
+        println!(
+            "  channel {} peak: {:.1} dBFS",
+            index + 1,
+            level::to_dbfs(*peak)
+        );
+    }
+    println!(
+        "  captured {} at {:.1} dBFS peak — this is the output mix, not the microphone",
+        selection.display_name,
+        level::to_dbfs(loudest)
     );
     Ok(())
 }

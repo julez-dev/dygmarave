@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 dygma_focus = "0.5.1"
 serialport = "4"
+cpal = { version = "0.18", default-features = false, features = ["pipewire", "pulseaudio"] }
 ctrlc = "3"
 
 [profile.release]
