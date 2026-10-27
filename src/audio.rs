@@ -15,7 +15,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::DeviceId;
+use cpal::{DeviceDirection, DeviceId, DeviceType};
 
 /// What a capture device actually carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub enum SourceKind {
     Monitor,
     /// A hardware input, i.e. a microphone. Never what a visualizer wants.
     Microphone,
-    /// Not classifiable from its name.
+    /// Not classifiable from the metadata or the name.
     Unknown,
 }
 
@@ -41,30 +41,67 @@ impl SourceKind {
 /// A capture device that was selected for use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
-    /// The cpal device identifier, which is also the PipeWire/PulseAudio node name.
-    pub id: String,
-    /// Human-readable name, for logs.
-    pub display_name: String,
-    pub kind: SourceKind,
+    id: String,
+    display_name: String,
+    kind: SourceKind,
 }
 
 impl Selection {
-    /// Whether this device is the default sink's monitor, which follows the
-    /// user's output choice instead of pinning one device.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub fn kind(&self) -> SourceKind {
+        self.kind
+    }
+
+    /// Whether this device is the sink's monitor handle, which tracks whichever
+    /// sink was default when the handle was opened.
     pub fn follows_default_sink(&self) -> bool {
-        self.id.contains("sink_default") || self.display_name == "default_sink"
+        is_default_sink(&self.id, &self.display_name)
     }
 }
 
 impl fmt::Display for Selection {
+    /// Always includes the identifier: a device whose description is missing
+    /// would otherwise be named as the empty string in error messages.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} ({}, {})",
-            self.display_name,
-            self.id,
-            self.kind.describe()
-        )
+        let name = if self.display_name.is_empty() {
+            "(unnamed)"
+        } else {
+            &self.display_name
+        };
+        write!(f, "{name} [{}] ({})", self.id, self.kind.describe())
+    }
+}
+
+/// A capture device as the host described it, before selection.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub id: String,
+    pub name: String,
+    pub direction: DeviceDirection,
+    pub device_type: DeviceType,
+}
+
+impl Candidate {
+    pub fn kind(&self) -> SourceKind {
+        classify(self.direction, self.device_type, &self.id, &self.name)
+    }
+
+    /// A candidate with the metadata a name-only host would report.
+    #[cfg(test)]
+    pub fn from_name(id: &str, name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            direction: DeviceDirection::Unknown,
+            device_type: DeviceType::Unknown,
+        }
     }
 }
 
@@ -82,7 +119,10 @@ pub enum AudioError {
     /// The audio server or the device refused the stream.
     Device(String),
     /// The stream ran but never carried any signal.
-    NoSignal { selection: Box<Selection> },
+    NoSignal {
+        selection: Box<Selection>,
+        blocks: u64,
+    },
 }
 
 impl fmt::Display for AudioError {
@@ -95,9 +135,8 @@ impl fmt::Display for AudioError {
             ),
             AudioError::NotAMonitor { selection } => write!(
                 f,
-                "refusing to capture {} because it is a {}; \
+                "refusing to capture {selection} because it is a {}; \
                  that would visualize the room, not the speakers",
-                selection.display_name,
                 selection.kind.describe()
             ),
             AudioError::NoSuchDevice {
@@ -109,17 +148,37 @@ impl fmt::Display for AudioError {
                 candidates.join("; ")
             ),
             AudioError::Device(message) => write!(f, "{message}"),
-            AudioError::NoSignal { selection } => write!(
+            AudioError::NoSignal { selection, blocks } => write!(
                 f,
-                "captured {} but heard nothing — is anything playing, \
-                 and is that sink the one it is playing to?",
-                selection.display_name
+                "captured {selection} and received {blocks} buffers, but every sample was zero — \
+                 is anything playing, and is that sink the one it is playing to?"
             ),
         }
     }
 }
 
 impl std::error::Error for AudioError {}
+
+/// Whether captured audio carried anything at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Verdict {
+    /// Something audible arrived, at this peak amplitude.
+    Heard(f32),
+    /// Only digital silence arrived.
+    Silent,
+}
+
+/// Decides whether capture heard anything.
+///
+/// Silence means *exact* zero, so a genuinely quiet passage — which still has
+/// non-zero samples — is never mistaken for a dead or paused source.
+pub fn verdict(loudest: f32) -> Verdict {
+    if loudest > 0.0 {
+        Verdict::Heard(loudest)
+    } else {
+        Verdict::Silent
+    }
+}
 
 /// One buffer of interleaved samples from the capture stream.
 pub struct Block {
@@ -131,6 +190,8 @@ pub struct Capture {
     _stream: cpal::Stream,
     pub channels: u16,
     pub sample_rate: u32,
+    /// Always f32: any other format is refused at open time, so this cannot
+    /// misreport what is being captured.
     pub sample_format: cpal::SampleFormat,
     /// The last stream error, recorded rather than printed: the callback runs on
     /// the audio thread, and writing to stderr from there corrupts a live meter.
@@ -141,101 +202,124 @@ impl Capture {
     /// Takes the most recent stream error, if the stream failed.
     ///
     /// Capturing a specific sink node fails when that node suspends, which is
-    /// normal for an idle sink; capturing `default_sink` does not.
+    /// normal for an idle sink; capturing the default sink's monitor does not.
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
-/// Classifies a capture device from its identifier and name.
-///
-/// PipeWire and PulseAudio name things predictably: hardware inputs are
-/// `alsa_input.*`, sinks are `alsa_output.*`, and a sink's monitor either *is*
-/// the sink node or ends in `.monitor`.
-pub fn classify(id: &str, name: &str) -> SourceKind {
-    let id = id.to_ascii_lowercase();
-    let name = name.to_ascii_lowercase();
+/// Whether a device is the sink's monitor handle.
+fn is_default_sink(id: &str, name: &str) -> bool {
+    id.to_ascii_lowercase().contains("sink_default") || name.eq_ignore_ascii_case("default_sink")
+}
 
-    if id.contains("alsa_input") || id.contains("input_default") || name == "default_input" {
+/// Classifies a capture device.
+///
+/// The host's own metadata decides when it is available: PipeWire exposes a sink
+/// as [`DeviceDirection::Duplex`] (capture it and you hear what it plays) and a
+/// microphone as [`DeviceDirection::Input`]. Names are only a fallback, because
+/// they vary by vendor — a Bluetooth microphone is `bluez_input.*`, not
+/// `alsa_input.*`.
+pub fn classify(
+    direction: DeviceDirection,
+    device_type: DeviceType,
+    id: &str,
+    name: &str,
+) -> SourceKind {
+    if matches!(device_type, DeviceType::Microphone) {
         return SourceKind::Microphone;
     }
-    if id.contains("sink_default")
-        || name == "default_sink"
+    match direction {
+        DeviceDirection::Input => return SourceKind::Microphone,
+        DeviceDirection::Duplex => return SourceKind::Monitor,
+        // Playback-only nodes cannot be captured at all.
+        DeviceDirection::Output => return SourceKind::Unknown,
+        // Anything else (including directions added later) falls back to names.
+        _ => {}
+    }
+
+    let id = id.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    if id.contains("alsa_input")
+        || id.contains("bluez_input")
+        || id.contains("bluez_source")
+        || id.contains("input_default")
+        || name == "default_input"
+    {
+        return SourceKind::Microphone;
+    }
+    if is_default_sink(&id, &name)
         || id.contains(".monitor")
         || id.contains("alsa_output")
+        || id.contains("bluez_output")
     {
         return SourceKind::Monitor;
     }
     SourceKind::Unknown
 }
 
-/// Picks a device to capture from, given the devices the host offers.
+/// Picks a device to capture from.
 ///
 /// Prefers the default sink's monitor so the visualizer follows the user's
 /// output choice; never returns a microphone.
-pub fn select(
-    candidates: &[(String, String)],
-    requested: Option<&str>,
-) -> Result<Selection, AudioError> {
-    let described: Vec<(String, String, SourceKind)> = candidates
+pub fn select(candidates: &[Candidate], requested: Option<&str>) -> Result<Selection, AudioError> {
+    let described: Vec<(Selection, SourceKind)> = candidates
         .iter()
-        .map(|(id, name)| (id.clone(), name.clone(), classify(id, name)))
+        .map(|candidate| {
+            let kind = candidate.kind();
+            (
+                Selection {
+                    id: candidate.id.clone(),
+                    display_name: candidate.name.clone(),
+                    kind,
+                },
+                kind,
+            )
+        })
         .collect();
+
+    let listing = || {
+        candidates
+            .iter()
+            .map(|candidate| format!("{} [{}]", candidate.name, candidate.id))
+            .collect::<Vec<_>>()
+    };
 
     if let Some(requested) = requested {
-        return described
+        let (selection, kind) = described
             .into_iter()
-            .find(|(id, name, _)| id == requested || name == requested)
-            .map(|(id, display_name, kind)| Selection {
-                id,
-                display_name,
-                kind,
-            })
+            .find(|(selection, _)| selection.id == requested || selection.display_name == requested)
             .ok_or_else(|| AudioError::NoSuchDevice {
                 requested: requested.to_string(),
-                candidates: candidates
-                    .iter()
-                    .map(|(id, name)| format!("{name} [{id}]"))
-                    .collect(),
-            })
-            .and_then(|selection| {
-                if selection.kind == SourceKind::Microphone {
-                    Err(AudioError::NotAMonitor {
-                        selection: Box::new(selection),
-                    })
-                } else {
-                    Ok(selection)
-                }
+                candidates: listing(),
+            })?;
+        if kind == SourceKind::Microphone {
+            return Err(AudioError::NotAMonitor {
+                selection: Box::new(selection),
             });
+        }
+        return Ok(selection);
     }
 
-    let monitors: Vec<&(String, String, SourceKind)> = described
+    let monitors: Vec<&(Selection, SourceKind)> = described
         .iter()
-        .filter(|(_, _, kind)| *kind == SourceKind::Monitor)
+        .filter(|(_, kind)| *kind == SourceKind::Monitor)
         .collect();
-
     let chosen = monitors
         .iter()
-        .find(|(id, name, _)| id.contains("sink_default") || name == &"default_sink".to_string())
+        .find(|(selection, _)| selection.follows_default_sink())
         .or_else(|| monitors.first());
 
     match chosen {
-        Some((id, display_name, kind)) => Ok(Selection {
-            id: id.clone(),
-            display_name: display_name.clone(),
-            kind: *kind,
-        }),
+        Some((selection, _)) => Ok(selection.clone()),
         None => Err(AudioError::NoMonitor {
-            candidates: candidates
-                .iter()
-                .map(|(id, name)| format!("{name} [{id}]"))
-                .collect(),
+            candidates: listing(),
         }),
     }
 }
 
-/// Enumerates the host's capture devices.
-fn capture_devices() -> Result<Vec<(String, String)>, AudioError> {
+/// Enumerates the host's capture devices with their metadata.
+fn capture_devices() -> Result<Vec<Candidate>, AudioError> {
     let host = cpal::default_host();
     let devices = host
         .input_devices()
@@ -243,11 +327,23 @@ fn capture_devices() -> Result<Vec<(String, String)>, AudioError> {
     Ok(devices
         .filter_map(|device| {
             let id = device.id().ok()?.to_string();
-            let name = device
-                .description()
+            let description = device.description().ok();
+            let name = description
+                .as_ref()
                 .map(|description| description.name().to_string())
                 .unwrap_or_default();
-            Some((id, name))
+            Some(Candidate {
+                id,
+                name,
+                direction: description
+                    .as_ref()
+                    .map(|description| description.direction())
+                    .unwrap_or(DeviceDirection::Unknown),
+                device_type: description
+                    .as_ref()
+                    .map(|description| description.device_type())
+                    .unwrap_or(DeviceType::Unknown),
+            })
         })
         .collect())
 }
@@ -259,20 +355,35 @@ pub fn choose(requested: Option<&str>) -> Result<Selection, AudioError> {
 
 /// Opens a capture stream, delivering interleaved sample blocks to `sink`.
 pub fn start(selection: &Selection, sink: Sender<Block>) -> Result<Capture, AudioError> {
+    // Defence in depth: selection already refuses microphones, but nothing stops
+    // a caller constructing a selection by hand.
+    if selection.kind() == SourceKind::Microphone {
+        return Err(AudioError::NotAMonitor {
+            selection: Box::new(selection.clone()),
+        });
+    }
+
     let host = cpal::default_host();
-    let device_id = DeviceId::from_str(&selection.id)
-        .map_err(|_| AudioError::Device(format!("unreadable device id {:?}", selection.id)))?;
+    let device_id = DeviceId::from_str(selection.id())
+        .map_err(|_| AudioError::Device(format!("unreadable device id {:?}", selection.id())))?;
     let device = host
         .device_by_id(&device_id)
         .ok_or_else(|| AudioError::NoSuchDevice {
-            requested: selection.id.clone(),
+            requested: selection.id().to_string(),
             candidates: Vec::new(),
         })?;
 
     let supported = device
         .default_input_config()
-        .map_err(|error| AudioError::Device(format!("{}: {error}", selection.display_name)))?;
-    let sample_format = supported.sample_format();
+        .map_err(|error| AudioError::Device(format!("{selection}: {error}")))?;
+    // The stream is built for f32 only, so anything else is refused here rather
+    // than measured wrongly or reported as a format we are not capturing.
+    if supported.sample_format() != cpal::SampleFormat::F32 {
+        return Err(AudioError::Device(format!(
+            "{selection}: unsupported sample format {:?}; this build captures f32 only",
+            supported.sample_format()
+        )));
+    }
     let config: cpal::StreamConfig = supported.into();
     let channels = config.channels;
     let sample_rate = config.sample_rate;
@@ -284,9 +395,10 @@ pub fn start(selection: &Selection, sink: Sender<Block>) -> Result<Capture, Audi
         .build_input_stream(
             config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // A full channel is gone: the consumer stops reading long before
-                // this matters, and blocking the audio thread is worse than a
-                // dropped block.
+                // The channel is unbounded and the consumer may stall (ticket 05
+                // will make it far slower than the audio thread). Blocking here
+                // would stall the audio callback, so a send that fails because
+                // the consumer is gone is simply dropped.
                 let _ = sink.send(Block {
                     samples: data.to_vec(),
                 });
@@ -307,7 +419,7 @@ pub fn start(selection: &Selection, sink: Sender<Block>) -> Result<Capture, Audi
         _stream: stream,
         channels,
         sample_rate,
-        sample_format,
+        sample_format: cpal::SampleFormat::F32,
         error: error_slot,
     })
 }
@@ -316,60 +428,121 @@ pub fn start(selection: &Selection, sink: Sender<Block>) -> Result<Capture, Audi
 mod tests {
     use super::*;
 
-    fn devices() -> Vec<(String, String)> {
+    fn candidate(id: &str, name: &str, direction: DeviceDirection, kind: DeviceType) -> Candidate {
+        Candidate {
+            id: id.to_string(),
+            name: name.to_string(),
+            direction,
+            device_type: kind,
+        }
+    }
+
+    fn devices() -> Vec<Candidate> {
         vec![
-            (
-                "pipewire:sink_default".to_string(),
-                "default_sink".to_string(),
+            candidate(
+                "pipewire:sink_default",
+                "default_sink",
+                DeviceDirection::Duplex,
+                DeviceType::Speaker,
             ),
-            (
-                "pipewire:input_default".to_string(),
-                "default_input".to_string(),
+            candidate(
+                "pipewire:input_default",
+                "default_input",
+                DeviceDirection::Input,
+                DeviceType::Microphone,
             ),
-            (
-                "pipewire:alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink".to_string(),
-                "USB Audio Speakers".to_string(),
+            candidate(
+                "pipewire:alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink",
+                "USB Audio Speakers",
+                DeviceDirection::Duplex,
+                DeviceType::Speaker,
             ),
-            (
-                "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback".to_string(),
-                "Auna Mic CM900 Mono".to_string(),
+            candidate(
+                "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
+                "Auna Mic CM900 Mono",
+                DeviceDirection::Input,
+                DeviceType::Microphone,
             ),
         ]
     }
 
     #[test]
-    fn classifies_microphones_and_monitors() {
+    fn classifies_microphones_and_monitors_from_host_metadata() {
         assert_eq!(
             classify(
-                "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
-                "Auna Mic CM900 Mono"
+                DeviceDirection::Input,
+                DeviceType::Microphone,
+                "pipewire:whatever",
+                "Whatever"
             ),
             SourceKind::Microphone
         );
         assert_eq!(
-            classify("pipewire:input_default", "default_input"),
-            SourceKind::Microphone
-        );
-        assert_eq!(
-            classify("pipewire:sink_default", "default_sink"),
-            SourceKind::Monitor
-        );
-        assert_eq!(
             classify(
-                "pipewire:alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink",
-                "USB Audio Speakers"
+                DeviceDirection::Duplex,
+                DeviceType::Speaker,
+                "pipewire:whatever",
+                "Whatever"
             ),
             SourceKind::Monitor
         );
-        // PulseAudio names a sink's monitor explicitly.
+    }
+
+    #[test]
+    fn classifies_vendor_specific_microphones_that_name_matching_misses() {
+        // A Bluetooth headset's capture node is neither alsa_input nor a monitor.
+        let bluetooth_mic = Candidate::from_name(
+            "pipewire:bluez_input.00:11:22:33:44:55",
+            "Bluetooth Headset",
+        );
         assert_eq!(
             classify(
+                DeviceDirection::Input,
+                DeviceType::Microphone,
+                &bluetooth_mic.id,
+                &bluetooth_mic.name
+            ),
+            SourceKind::Microphone
+        );
+        // ...and the same name matched only by the fallback path.
+        assert_eq!(bluetooth_mic.kind(), SourceKind::Microphone);
+    }
+
+    #[test]
+    fn classifies_a_bluetooth_sink_as_a_monitor() {
+        assert_eq!(
+            classify(
+                DeviceDirection::Duplex,
+                DeviceType::Headphones,
+                "pipewire:bluez_output.00:11:22:33:44:55",
+                "Bluetooth Headphones"
+            ),
+            SourceKind::Monitor
+        );
+    }
+
+    #[test]
+    fn falls_back_to_names_when_the_host_reports_no_metadata() {
+        assert_eq!(
+            Candidate::from_name(
                 "pulse:alsa_output.pci-0000_01_00.1.hdmi-stereo.monitor",
                 "HDMI monitor"
-            ),
+            )
+            .kind(),
             SourceKind::Monitor
         );
-        assert_eq!(classify("pipewire:Firefox", "Firefox"), SourceKind::Unknown);
+        assert_eq!(
+            Candidate::from_name(
+                "pulse:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
+                "Auna Mic CM900 Mono"
+            )
+            .kind(),
+            SourceKind::Microphone
+        );
+        assert_eq!(
+            Candidate::from_name("pipewire:Firefox", "Firefox").kind(),
+            SourceKind::Unknown
+        );
     }
 
     #[test]
@@ -379,30 +552,34 @@ mod tests {
         let mut candidates = devices();
         candidates.swap(0, 2);
         let selection = select(&candidates, None).unwrap();
-        assert_eq!(selection.id, "pipewire:sink_default");
+        assert_eq!(selection.id(), "pipewire:sink_default");
         assert!(selection.follows_default_sink());
     }
 
     #[test]
     fn never_selects_the_microphone_when_choosing_automatically() {
         let selection = select(&devices(), None).unwrap();
-        assert_eq!(selection.kind, SourceKind::Monitor);
+        assert_eq!(selection.kind(), SourceKind::Monitor);
     }
 
     #[test]
     fn falls_back_to_another_monitor_when_no_default_sink_device_exists() {
         let candidates = vec![
-            (
-                "pipewire:alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink".to_string(),
-                "USB Audio Speakers".to_string(),
+            candidate(
+                "pipewire:alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink",
+                "USB Audio Speakers",
+                DeviceDirection::Duplex,
+                DeviceType::Speaker,
             ),
-            (
-                "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback".to_string(),
-                "Auna Mic CM900 Mono".to_string(),
+            candidate(
+                "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
+                "Auna Mic CM900 Mono",
+                DeviceDirection::Input,
+                DeviceType::Microphone,
             ),
         ];
         let selection = select(&candidates, None).unwrap();
-        assert!(selection.id.contains("alsa_output"));
+        assert!(selection.id().contains("alsa_output"));
         assert!(!selection.follows_default_sink());
     }
 
@@ -412,15 +589,28 @@ mod tests {
         let AudioError::NotAMonitor { selection } = error else {
             panic!("expected a microphone refusal");
         };
-        assert_eq!(selection.kind, SourceKind::Microphone);
+        assert_eq!(selection.kind(), SourceKind::Microphone);
         assert!(selection.to_string().contains("microphone"));
     }
 
     #[test]
+    fn refuses_a_bluetooth_microphone_asked_for_by_id() {
+        let candidates = vec![candidate(
+            "pipewire:bluez_input.00:11:22:33:44:55",
+            "Bluetooth Headset",
+            DeviceDirection::Input,
+            DeviceType::Microphone,
+        )];
+        let error =
+            select(&candidates, Some("pipewire:bluez_input.00:11:22:33:44:55")).unwrap_err();
+        assert!(matches!(error, AudioError::NotAMonitor { .. }));
+    }
+
+    #[test]
     fn an_explicit_override_may_pick_an_unclassified_device() {
-        let candidates = vec![("pipewire:42".to_string(), "Some App".to_string())];
+        let candidates = vec![Candidate::from_name("pipewire:42", "Some App")];
         let selection = select(&candidates, Some("pipewire:42")).unwrap();
-        assert_eq!(selection.kind, SourceKind::Unknown);
+        assert_eq!(selection.kind(), SourceKind::Unknown);
     }
 
     #[test]
@@ -434,11 +624,31 @@ mod tests {
 
     #[test]
     fn explains_itself_when_there_is_no_monitor_at_all() {
-        let candidates = vec![(
-            "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback".to_string(),
-            "Auna Mic CM900 Mono".to_string(),
+        let candidates = vec![candidate(
+            "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
+            "Auna Mic CM900 Mono",
+            DeviceDirection::Input,
+            DeviceType::Microphone,
         )];
         let error = select(&candidates, None).unwrap_err();
         assert!(error.to_string().contains("no monitor source"));
+    }
+
+    #[test]
+    fn an_unnamed_device_is_still_named_in_errors() {
+        let selection = Selection {
+            id: "pipewire:42".to_string(),
+            display_name: String::new(),
+            kind: SourceKind::Monitor,
+        };
+        assert!(selection.to_string().contains("(unnamed)"));
+        assert!(selection.to_string().contains("pipewire:42"));
+    }
+
+    #[test]
+    fn silence_means_exact_zero_not_a_quiet_passage() {
+        assert_eq!(verdict(0.0), Verdict::Silent);
+        // -80 dBFS is inaudible but still a signal; it must not be called silent.
+        assert!(matches!(verdict(0.0001), Verdict::Heard(_)));
     }
 }

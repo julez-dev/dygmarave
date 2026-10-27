@@ -1,9 +1,13 @@
-//! dygmarave — prove the LED path and measure the frame budget.
+//! dygmarave — audio-reactive LEDs on a Dygma Raise.
 //!
-//! Ticket 01's deliverable: find the board by USB identity, learn its LED count
-//! from the board itself, hold a written frame long enough to prove no active
-//! effect paints over it, measure how many full frames per second the link
-//! sustains, and put the keyboard back exactly as it was found.
+//! Two probes exist so far, one per half of the eventual pipeline:
+//!
+//! * the default `LED path` finds the board by USB identity, learns its LED count
+//!   from the board itself, holds a written frame long enough to prove no active
+//!   effect paints over it, measures full-frame throughput, and restores the
+//!   keyboard exactly as it was found (ticket 01);
+//! * `--probe-audio` captures the output mix and prints a live level meter,
+//!   refusing microphones (ticket 02).
 
 mod args;
 mod audio;
@@ -24,7 +28,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audio::{AudioError, SourceKind};
+use audio::{verdict, AudioError, SourceKind, Verdict};
 use link::DygmaLink;
 use session::Session;
 use theme::{Frame, Rgb};
@@ -46,7 +50,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let interrupted = install_interrupt_handler()?;
+    let interrupted = install_interrupt_handler(if args.probe_audio {
+        "stopping"
+    } else {
+        "restoring the keyboard"
+    })?;
 
     if args.probe_audio {
         return probe_audio(&args, &interrupted);
@@ -151,12 +159,12 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
     println!(
         "source: {selection}{}",
         if selection.follows_default_sink() {
-            " — follows the default sink"
+            " — the default sink's monitor, as chosen at startup"
         } else {
             ""
         }
     );
-    if selection.kind == SourceKind::Unknown {
+    if selection.kind() == SourceKind::Unknown {
         println!("  note: this device is not recognisable as a monitor; capturing it because you named it");
     }
 
@@ -170,6 +178,7 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
 
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
     let mut loudest = 0.0f32;
+    let mut blocks = 0u64;
     let mut held = vec![0.0f32; capture.channels as usize];
     let mut window: Vec<f32> = Vec::new();
     let mut last_draw = Instant::now();
@@ -184,7 +193,10 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
 
     while Instant::now() < deadline && !interrupted.load(Ordering::SeqCst) {
         match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(block) => window.extend_from_slice(&block.samples),
+            Ok(block) => {
+                blocks += 1;
+                window.extend_from_slice(&block.samples);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -213,12 +225,25 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
     }
     let stream_error = capture.take_error();
 
-    if loudest <= 0.0 {
+    // The last window is measured too: audio that started just before the
+    // deadline is still audio, and discarding it reported "heard nothing" for a
+    // source that had plainly been heard.
+    if let Some(levels) = level::measure(&window, capture.channels) {
+        loudest = loudest.max(levels.loudest());
+        for (index, peak) in levels.peak.iter().enumerate() {
+            if let Some(slot) = held.get_mut(index) {
+                *slot = slot.max(*peak);
+            }
+        }
+    }
+
+    if verdict(loudest) == Verdict::Silent {
         if let Some(error) = stream_error {
             println!("  stream stopped: {error}");
         }
         return Err(AudioError::NoSignal {
             selection: Box::new(selection),
+            blocks,
         }
         .into());
     }
@@ -234,7 +259,7 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
     }
     println!(
         "  captured {} at {:.1} dBFS peak — this is the output mix, not the microphone",
-        selection.display_name,
+        selection.display_name(),
         level::to_dbfs(loudest)
     );
     Ok(())
@@ -242,15 +267,15 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
 
 /// Turns Ctrl-C into a flag so the baseline can be restored before exiting.
 /// A second Ctrl-C gives up and exits immediately.
-fn install_interrupt_handler() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
+fn install_interrupt_handler(what: &'static str) -> Result<Arc<AtomicBool>, Box<dyn Error>> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&interrupted);
     ctrlc::set_handler(move || {
         if flag.swap(true, Ordering::SeqCst) {
-            eprintln!("\naborting without restore");
+            eprintln!("\naborting");
             std::process::exit(130);
         }
-        eprintln!("\ninterrupted — restoring the keyboard, Ctrl-C again to abort");
+        eprintln!("\ninterrupted — {what}, Ctrl-C again to abort");
     })?;
     Ok(interrupted)
 }

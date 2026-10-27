@@ -27,14 +27,18 @@ pub fn measure(samples: &[f32], channels: u16) -> Option<Levels> {
     let mut sum_squares = vec![0.0f32; channels];
     let mut counts = vec![0usize; channels];
 
-    for (index, sample) in samples.iter().enumerate() {
-        let channel = index % channels;
-        let magnitude = sample.abs();
-        if magnitude > peak[channel] {
-            peak[channel] = magnitude;
+    // Whole frames only: a buffer whose length is not a multiple of the channel
+    // count ends with a partial frame, and guessing which channels it belongs to
+    // would silently misattribute those samples.
+    for frame in samples.chunks_exact(channels) {
+        for (channel, sample) in frame.iter().enumerate() {
+            let magnitude = sample.abs();
+            if magnitude > peak[channel] {
+                peak[channel] = magnitude;
+            }
+            sum_squares[channel] += sample * sample;
+            counts[channel] += 1;
         }
-        sum_squares[channel] += sample * sample;
-        counts[channel] += 1;
     }
 
     let rms = sum_squares
@@ -131,6 +135,14 @@ mod tests {
             .collect();
         let levels = measure(&samples, 1).unwrap();
         assert!((levels.rms[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_trailing_partial_frame_is_ignored() {
+        // Five samples is two full stereo frames plus an orphan.
+        let levels = measure(&[0.1, 0.2, 0.3, 0.4, 1.0], 2).unwrap();
+        assert_eq!(levels.peak, vec![0.3, 0.4]);
+        assert!((levels.rms[0] - 0.1f32.hypot(0.3) / 2f32.sqrt()).abs() < 1e-6);
     }
 
     #[test]

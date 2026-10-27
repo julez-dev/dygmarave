@@ -1,7 +1,7 @@
 //! Command-line arguments.
 //!
-//! Deliberately hand-rolled: ticket 01 needs four flags, and the config module
-//! (ticket 09) will own the real surface.
+//! Deliberately hand-rolled: the two probes need a handful of flags, and the
+//! config module (ticket 09) will own the real surface.
 
 use crate::theme::Rgb;
 
