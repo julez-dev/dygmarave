@@ -1,0 +1,160 @@
+//! Colour values and the `led.theme` wire format.
+//!
+//! The Focus protocol is plain-text and space-separated: a full frame is
+//! `led.theme R G B R G B …`, one triplet per LED index, and the device's reply
+//! to a bare `led.theme` is the same shape of triplet list. Both directions are
+//! handled here so nothing else has to know the format.
+
+use std::fmt;
+
+/// An 8-bit RGB colour, matching the device's per-LED precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+impl fmt::Display for Rgb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} {}", self.r, self.g, self.b)
+    }
+}
+
+/// Why a device reply could not be read as a theme.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThemeError {
+    /// The reply contained no colour values at all.
+    Empty,
+    /// The value count is not a whole number of RGB triplets.
+    Ragged { values: usize },
+    /// A value was not a byte-sized integer.
+    BadValue { token: String },
+}
+
+impl fmt::Display for ThemeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ThemeError::Empty => write!(f, "the device returned no colour values"),
+            ThemeError::Ragged { values } => write!(
+                f,
+                "the device returned {values} values, which is not a whole number of RGB triplets"
+            ),
+            ThemeError::BadValue { token } => {
+                write!(f, "the device returned a value that is not a byte: {token:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ThemeError {}
+
+/// Parses a `led.theme` reply into one colour per LED index.
+///
+/// The verifier's lone `.` terminator is tolerated here rather than assumed to
+/// have been stripped, so a framing change upstream cannot silently corrupt the
+/// colour list.
+pub fn parse_theme_reply(reply: &str) -> Result<Vec<Rgb>, ThemeError> {
+    let values = reply
+        .split_whitespace()
+        .filter(|token| *token != ".")
+        .map(|token| {
+            token.parse::<u8>().map_err(|_| ThemeError::BadValue {
+                token: token.to_string(),
+            })
+        })
+        .collect::<Result<Vec<u8>, ThemeError>>()?;
+
+    if values.is_empty() {
+        return Err(ThemeError::Empty);
+    }
+    if values.len() % 3 != 0 {
+        return Err(ThemeError::Ragged {
+            values: values.len(),
+        });
+    }
+
+    Ok(values
+        .chunks_exact(3)
+        .map(|rgb| Rgb::new(rgb[0], rgb[1], rgb[2]))
+        .collect())
+}
+
+/// Encodes a colour list as the body of a `led.theme` command, without a
+/// trailing newline (the link adds framing).
+pub fn encode_theme(colors: &[Rgb]) -> String {
+    let mut out = String::with_capacity(10 + colors.len() * 12);
+    out.push_str("led.theme");
+    for color in colors {
+        out.push(' ');
+        out.push_str(&color.to_string());
+    }
+    out
+}
+
+/// A full frame filled with one colour, sized to the board's LED count.
+pub fn uniform(count: usize, color: Rgb) -> Vec<Rgb> {
+    vec![color; count]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_one_colour_per_triplet() {
+        let colors = parse_theme_reply("1 2 3 4 5 6").unwrap();
+        assert_eq!(colors, vec![Rgb::new(1, 2, 3), Rgb::new(4, 5, 6)]);
+    }
+
+    #[test]
+    fn tolerates_terminator_and_whitespace() {
+        let colors = parse_theme_reply("  1 2 3\r\n.\r\n").unwrap();
+        assert_eq!(colors, vec![Rgb::new(1, 2, 3)]);
+    }
+
+    #[test]
+    fn rejects_ragged_value_count() {
+        assert_eq!(
+            parse_theme_reply("1 2 3 4").unwrap_err(),
+            ThemeError::Ragged { values: 4 }
+        );
+    }
+
+    #[test]
+    fn rejects_empty_reply() {
+        assert_eq!(parse_theme_reply("  . \r\n").unwrap_err(), ThemeError::Empty);
+    }
+
+    #[test]
+    fn rejects_out_of_range_value() {
+        assert_eq!(
+            parse_theme_reply("1 2 300").unwrap_err(),
+            ThemeError::BadValue {
+                token: "300".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn encodes_a_frame_the_device_can_parse() {
+        assert_eq!(
+            encode_theme(&[Rgb::new(1, 2, 3), Rgb::new(255, 0, 10)]),
+            "led.theme 1 2 3 255 0 10"
+        );
+    }
+
+    #[test]
+    fn encoding_round_trips_through_parsing() {
+        let frame = uniform(132, Rgb::new(32, 96, 255));
+        let encoded = encode_theme(&frame);
+        let body = encoded.strip_prefix("led.theme ").unwrap();
+        assert_eq!(parse_theme_reply(body).unwrap(), frame);
+    }
+}

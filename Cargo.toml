@@ -1,0 +1,14 @@
+[package]
+name = "dygmarave"
+version = "0.1.0"
+edition = "2021"
+description = "Audio-reactive per-key LED visualizer for the Dygma Raise"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+dygma_focus = "0.5.1"
+serialport = "4"
+ctrlc = "3"
+
+[profile.release]
+strip = true
