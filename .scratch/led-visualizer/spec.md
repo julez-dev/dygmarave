@@ -23,6 +23,7 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | LED mode | Query current mode, switch to a static non-repainting one, restore on exit (mode is EEPROM-persisted) | — |
 | Frame write | Fire-and-forget, no per-frame terminator wait; a periodic health probe catches a dead port | — |
 | Layer-change flash | Accepted, not prevented: the firmware repaints on a layer change and no Focus command can stop it, so the next frame redraws over it (~33 ms at 30 fps) | — |
+| Audio backlog | Drains every captured block in order each frame, so the analyzer's window stays contiguous; only a multi-second stall drops the oldest whole blocks (cap 32) | ticket 05 |
 | Bands | 28 analysed; a half displays 26 (left) / 27 (right) because that is how many letter keys it has; snake, mirrored, bass at inner edges | ADR-0003 |
 | Audio | System output only, PulseAudio/PipeWire monitor source via `cpal` | — |
 | Analysis | 1024-sample window (≈21 ms at 48 kHz), log-spaced 40 Hz–16 kHz | — |
@@ -84,6 +85,9 @@ attack = "instant"
 decay_ms = 180
 gate_db = -55.0
 agc_release_ms = 4000
+target = 0.7             # AGC ceiling; pure white stays at 1.0, so loud never clips to white
+max_gain = 100.0         # 40 dB, enough for a track mastered at the -55 dBFS gate
+floor = 0.02             # below this a decaying band is drawn black, so silence goes dark
 
 [thumbs]
 level = true

@@ -210,6 +210,16 @@ impl<L: Link> Session<L> {
         Frame::uniform(self.led_count(), color)
     }
 
+    /// Discards acknowledgements the board has already written.
+    ///
+    /// The board answers every frame, so a long run must clear them or the
+    /// kernel buffer fills and the firmware stalls. The frame loop cannot afford
+    /// a `query` (which drains first and then waits for a reply), so it calls
+    /// this on a cadence instead — the same trick the benchmark uses.
+    pub fn drain_acks(&mut self) -> Result<usize, SessionError> {
+        Ok(self.link.drain()?)
+    }
+
     /// Writes one full frame, refusing a frame that does not match the board.
     pub fn write_frame(&mut self, frame: &Frame) -> Result<(), SessionError> {
         if frame.leds() != self.led_count() {
@@ -284,8 +294,8 @@ impl<L: Link> Drop for Session<L> {
     }
 }
 
-/// Sleeps in small slices so an interrupt does not have to wait out a hold.
-fn sleep_unless_interrupted(total: Duration, interrupted: &AtomicBool) {
+/// Sleeps in small slices so an interrupt does not have to wait out a frame.
+pub(crate) fn sleep_unless_interrupted(total: Duration, interrupted: &AtomicBool) {
     let deadline = Instant::now() + total;
     while Instant::now() < deadline {
         if interrupted.load(Ordering::SeqCst) {
@@ -400,6 +410,16 @@ mod tests {
             "the frame written plus the restored baseline"
         );
         assert_eq!(log.last().unwrap(), "led.mode 1");
+    }
+
+    #[test]
+    fn drain_acks_clears_what_the_board_has_written() {
+        // The frame loop calls this on a cadence instead of querying, so it must
+        // actually reach the port and clear the pending acknowledgements.
+        let mut session = opened(4);
+        session.link.pending_acks = 3;
+        assert_eq!(session.drain_acks().unwrap(), 3);
+        assert_eq!(session.drain_acks().unwrap(), 0, "nothing left to discard");
     }
 
     #[test]

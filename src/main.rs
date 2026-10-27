@@ -9,7 +9,9 @@
 //! * `--probe-audio` captures the output mix and prints a live level meter,
 //!   refusing microphones (ticket 02);
 //! * `--probe-spectrum` prints 28 log-spaced band energies per channel, the
-//!   analysis the renderer will consume (ticket 03).
+//!   analysis the renderer will consume (ticket 03);
+//! * `--live` is the product: the output mix drives the board continuously,
+//!   band energies through the colour ramp at a steady frame rate (ticket 05).
 
 mod args;
 mod audio;
@@ -17,6 +19,8 @@ mod bench;
 mod layout;
 mod level;
 mod link;
+mod live;
+mod render;
 mod session;
 mod spectrum;
 mod theme;
@@ -53,6 +57,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("{}", args::USAGE);
         return Ok(());
     }
+    if args.live && args.probe_audio {
+        return Err("--live and --probe-audio are mutually exclusive;                     the first drives the board, the second only prints a meter"
+            .into());
+    }
 
     let interrupted = install_interrupt_handler(if args.probe_audio {
         "stopping"
@@ -65,6 +73,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if args.probe_audio {
         return probe_audio(&args, &interrupted);
+    }
+    if args.live {
+        return live_visualizer(&args, &interrupted);
     }
 
     let device = match &args.port {
@@ -474,6 +485,84 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
         "  captured {} at {:.1} dBFS peak — this is the output mix, not the microphone",
         selection.display_name(),
         level::to_dbfs(probe.loudest())
+    );
+    Ok(())
+}
+
+/// Runs the visualizer until interrupted: audio in, frames out, steady pace.
+///
+/// The audio source is resolved *before* the board is touched, so a failed
+/// capture leaves the keyboard alone rather than flashing it and restoring.
+fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    let selection = audio::choose(args.source.as_deref())?;
+    println!("source: {selection}");
+
+    let (sender, receiver) = mpsc::channel();
+    let capture = audio::start(&selection, sender)?;
+    println!(
+        "  {} channels at {} Hz — drive the board until Ctrl-C",
+        capture.channels, capture.sample_rate
+    );
+
+    let device = match &args.port {
+        Some(port) => DygmaLink::from_port(port)?,
+        None => DygmaLink::discover()?,
+    };
+    let port_name = device.port_name().to_string();
+    let mut session = Session::open(device)?;
+    let count = session.led_count();
+
+    let plan = spectrum::BandPlan::standard(capture.sample_rate, spectrum::FFT_SIZE);
+    let config = live::LiveConfig {
+        fps: args.fps,
+        channels: capture.channels as usize,
+    };
+    let mut visualizer = live::Live::new(config, plan, count, Instant::now());
+    println!(
+        "  port {port_name} — {count} LEDs, {} fps, {} bands",
+        visualizer.fps(),
+        spectrum::BAND_COUNT
+    );
+
+    let mut frames = 0u64;
+    let mut acks = 0u64;
+    while !interrupted.load(Ordering::SeqCst) {
+        // Drain every block in order so the analyzer's window stays contiguous;
+        // only a multi-second stall trips the cap and drops the oldest whole
+        // blocks. Draining to just the newest block would splice two moments of
+        // audio together and click, which reads as strobing at the frame rate.
+        let (latest, dropped) = live::Live::drain(&receiver);
+        let frame = visualizer.step(latest.as_ref(), Instant::now(), dropped);
+        session.write_frame(&frame)?;
+        frames += 1;
+        if frames.is_multiple_of(bench::DRAIN_EVERY as u64) {
+            acks += session.drain_acks()? as u64;
+        }
+        // Pacing after the write, so the board's write time is absorbed by the
+        // schedule instead of pushing every frame past its deadline.
+        let wait = visualizer.wait(Instant::now());
+        if let Some(error) = capture.take_error() {
+            // A mid-set stream failure is not "no signal was ever heard" — that
+            // error means every sample was zero. Report the actual failure and
+            // let Session's Drop put the board back on the way out.
+            return Err(
+                format!("audio stream stopped mid-set after {frames} frames: {error}").into(),
+            );
+        }
+        session::sleep_unless_interrupted(wait, interrupted);
+    }
+
+    println!();
+    println!(
+        "  {frames} frames, {} blocks discarded after a stall, {acks} acknowledgements discarded, {} pacing resyncs",
+        visualizer.dropped_blocks(),
+        visualizer.resyncs()
+    );
+    session.restore()?;
+    println!(
+        "  restored LED mode {} ({})",
+        session.baseline().mode.code(),
+        session.baseline().mode.name()
     );
     Ok(())
 }

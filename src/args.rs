@@ -25,6 +25,10 @@ pub struct Args {
     pub gradient: bool,
     /// Print band energies instead of a broadband meter.
     pub probe_spectrum: bool,
+    /// Drive the board live from whatever the speakers are playing.
+    pub live: bool,
+    /// Frames per second for the live visualizer.
+    pub fps: u32,
     /// How long to probe audio for.
     pub seconds: u64,
     /// Capture device to use instead of choosing one.
@@ -44,6 +48,8 @@ impl Default for Args {
             rows: false,
             gradient: false,
             probe_spectrum: false,
+            live: false,
+            fps: 30,
             seconds: 5,
             source: None,
             help: false,
@@ -63,6 +69,8 @@ Options:
   --frames <N>        frames to write when measuring (default 120)
   --probe-audio       probe the audio path instead of the LED path
   --probe-spectrum    probe audio and print 28 log-spaced band energies
+  --live              drive the board live from the output mix (Ctrl-C stops)
+  --fps <N>           frames per second for --live (default 30)
   --columns           paint each physical column a different colour
   --rows              paint each physical row a different colour
   --gradient          paint the band sequence as a hue ramp
@@ -73,6 +81,8 @@ Options:
 With --probe-audio, the default sink's monitor is captured (never the
 microphone) and a live level meter is printed, failing if no signal arrives.
 --probe-spectrum replaces the meter with one character per frequency band.
+--live drives the board from the output mix until Ctrl-C: a moving spectrum,
+band energies through the colour ramp, instant attack and slow decay.
 
 The board is found by USB identity, not by a fixed port name. The LED count is
 read from the board itself. The baseline theme and LED mode are restored on exit
@@ -113,6 +123,20 @@ where
             "--probe-spectrum" => {
                 parsed.probe_audio = true;
                 parsed.probe_spectrum = true;
+            }
+            "--live" => parsed.live = true,
+            "--fps" => {
+                let value = next_value(&mut args, &flag)?;
+                let fps = value
+                    .parse()
+                    .map_err(|_| format!("--fps expects a whole number, got {value:?}"))?;
+                // 0 would silently become 1 fps; an absurd value makes the period
+                // vanish and turns the loop into an unthrottled write storm. The
+                // board measured ~69 fps, so 240 leaves headroom for ticket 07.
+                if !(1..=240).contains(&fps) {
+                    return Err(format!("--fps expects 1 to 240, got {fps}"));
+                }
+                parsed.fps = fps;
             }
             "--seconds" => {
                 let value = next_value(&mut args, &flag)?;
@@ -182,6 +206,21 @@ mod tests {
         assert_eq!(parsed.colour, Rgb::new(1, 2, 3));
         assert_eq!(parsed.hold_ms, 500);
         assert_eq!(parsed.frames, 60);
+    }
+
+    #[test]
+    fn parses_the_live_flags() {
+        let parsed = args(&["--live", "--fps", "60"]).unwrap();
+        assert!(parsed.live);
+        assert_eq!(parsed.fps, 60);
+        assert_eq!(Args::default().fps, 30, "30 fps unless asked otherwise");
+    }
+
+    #[test]
+    fn rejects_an_fps_outside_the_supported_range() {
+        assert!(args(&["--fps", "0"]).unwrap_err().contains("1 to 240"));
+        assert!(args(&["--fps", "241"]).unwrap_err().contains("1 to 240"));
+        assert!(args(&["--fps", "240"]).is_ok());
     }
 
     #[test]

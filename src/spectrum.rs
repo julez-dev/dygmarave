@@ -174,6 +174,14 @@ impl Spectrum {
         &self.per_channel[channel]
     }
 
+    /// Fills one channel's bands, for tests that need a spectrum without
+    /// running an FFT.
+    #[cfg(test)]
+    pub fn set_bands(&mut self, channel: usize, values: &[f32]) {
+        self.per_channel[channel].clear();
+        self.per_channel[channel].extend_from_slice(values);
+    }
+
     /// One band's amplitude. Tests index single bands; the renderer takes the
     /// whole slice.
     #[cfg(test)]
