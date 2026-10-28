@@ -152,13 +152,13 @@ const DEPTHS: usize = 7;
 const CELLS: usize = LETTER_ROW_COUNT * DEPTHS;
 
 /// How many rows a half's letter grid has.
-pub const ROW_COUNT: usize = LETTER_ROW_COUNT;
+pub(crate) const ROW_COUNT: usize = LETTER_ROW_COUNT;
 
 /// How many depth columns a half's letter grid has.
-pub const DEPTH_COUNT: usize = DEPTHS;
+pub(crate) const DEPTH_COUNT: usize = DEPTHS;
 
 /// How many cells the full 4×7 rectangle has, holes included.
-pub const CELL_COUNT: usize = CELLS;
+pub(crate) const CELL_COUNT: usize = CELLS;
 
 /// One cell of a half's normalised letter grid.
 ///
@@ -166,7 +166,7 @@ pub const CELL_COUNT: usize = CELLS;
 /// coordinates describe both halves; each half maps them to its mirror-image
 /// physical columns and filters its own holes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cell {
+pub(crate) struct Cell {
     row: u8,
     depth: u8,
 }
@@ -180,22 +180,22 @@ impl Cell {
     }
 
     /// The cell's row, 0–3 top to bottom.
-    pub const fn row(self) -> usize {
+    pub(crate) const fn row(self) -> usize {
         self.row as usize
     }
 
     /// The cell's depth, 0–6 inner to outer.
-    pub const fn depth(self) -> usize {
+    pub(crate) const fn depth(self) -> usize {
         self.depth as usize
     }
 
     /// The cell's index in the row-major 4×7 rectangle, 0–27.
-    pub const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         self.row as usize * DEPTHS + self.depth as usize
     }
 
     /// The cell at a row-major rectangle index, or `None` outside 0–27.
-    pub const fn from_index(index: usize) -> Option<Self> {
+    pub(crate) const fn from_index(index: usize) -> Option<Self> {
         if index >= CELLS {
             return None;
         }
@@ -208,7 +208,7 @@ impl Cell {
     /// The physical LED at this normalised cell, or `None` where the half has a
     /// hole. Physical columns are mirrored: left depth 0 is column 6, right depth
     /// 0 is column 9.
-    pub fn led(self, half: Half) -> Option<u8> {
+    pub(crate) fn led(self, half: Half) -> Option<u8> {
         let column = match half {
             Half::Left => 6usize.checked_sub(self.depth as usize)?,
             Half::Right => 9 + self.depth as usize,
@@ -488,7 +488,7 @@ pub fn band_leds_for(layout: &Layout, half: Half) -> Vec<u8> {
 ///
 /// Renderers that need the key's geometry (for motion) use this instead of
 /// [`band_leds_for`], so the coordinate is not thrown away and re-derived.
-pub fn band_cells_for(layout: &Layout, half: Half) -> Vec<(Cell, u8)> {
+pub(crate) fn band_cells_for(layout: &Layout, half: Half) -> Vec<(Cell, u8)> {
     cells_in_order(layout)
         .into_iter()
         .filter_map(|cell| cell.led(half).map(|led| (cell, led)))

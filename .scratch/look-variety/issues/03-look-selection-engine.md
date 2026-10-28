@@ -35,8 +35,13 @@ it owns the fade state so `render::compose` stays pure.
 - [ ] `fade_ms = 0` cuts immediately. Fade alpha is wall-clock based, monotonic,
       and reaches the target exactly at the deadline. A smoothstep curve is fine;
       linear is acceptable if documented.
-- [ ] On selecting a different motion, pending `sparkle`/`ripple`/`rain` events
-      are cleared. Periodic motion phase is continuous.
+- [ ] On selecting a different motion, call `MotionState::set_settings`/
+      `reset_events`, which clears pending `sparkle`/`ripple`/`rain` events while
+      periodic motion phase stays continuous.
+- [ ] `MotionState` is the active motion selection plus runtime: the engine keeps
+      the current `Motion`/`MotionSettings` for scheduling and logging, passes the
+      state explicitly to `render::compose` alongside `Look`, and advances it once
+      per frame.
 - [ ] The engine exposes the switch details needed by ticket 04 for logging
       (axis, from, to, reason).
 - [ ] Tests: bag fairness/no boundary repeat, one-element pool, jitter bounds,
@@ -52,6 +57,9 @@ it owns the fade state so `render::compose` stays pure.
 - Store a `LayoutKind` in the settings and call `LayoutKind::resolve(&mut rng)`
   once when a selection is drawn. Cache the resolved band table for the turn;
   never redraw scatter or recompute the permutation per frame.
+- `render::compose(dynamics, count, look, &motion)` already takes `MotionState`
+  explicitly. Reuse one state per engine, not a new state per frame; the engine
+  owns motion scheduling/logging and calls `advance` exactly once per frame.
 - Suggested shape: `LookState::new(settings, seed, now) -> LookState`,
   `LookState::tick(now) -> Option<Switch>`, `LookState::selection() -> Selection`,
   `LookState::fade_alpha(now) -> f32`,

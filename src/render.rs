@@ -108,6 +108,10 @@ pub struct Dynamics {
     energy_average: Vec<f32>,
     /// Whether the channel's bass energy was above the threshold last frame.
     was_above_threshold: Vec<bool>,
+    /// Monotonic count of rising-edge beats per channel. Motion events use this
+    /// rather than the flash timer, which can expire between low-frame-rate
+    /// advances and lasts several frames at high frame rates.
+    beat_count: Vec<u64>,
     /// Remaining time of the white flash per channel, in milliseconds.
     flash_remaining: Vec<f32>,
     /// The level shown on the thumb cluster per channel, 0..=1.
@@ -125,6 +129,7 @@ impl Dynamics {
             open: vec![false; channels],
             energy_average: vec![0.0; channels],
             was_above_threshold: vec![false; channels],
+            beat_count: vec![0; channels],
             flash_remaining: vec![0.0; channels],
             thumb_level: vec![0.0; channels],
         }
@@ -160,8 +165,18 @@ impl Dynamics {
     }
 
     /// Whether a beat flash is currently active for this channel.
+    ///
+    /// This drives the white thumb flash only. Event motions must use
+    /// [`Dynamics::beat_count`] instead: the flash can decay to zero before a
+    /// low-frame-rate advance observes it, and stays true for several frames at
+    /// higher rates.
     pub fn is_flashing(&self, channel: usize) -> bool {
         self.flash_remaining[channel] > 0.0
+    }
+
+    /// How many rising-edge beats this channel has seen, monotonically.
+    pub fn beat_count(&self, channel: usize) -> u64 {
+        self.beat_count[channel]
     }
 
     /// Advances every band by `dt` seconds.
@@ -222,6 +237,7 @@ impl Dynamics {
             // Trigger only on a rising edge: a sustained tone would otherwise keep
             // re-triggering and leave the flash permanently on.
             if above && !self.was_above_threshold[channel] {
+                self.beat_count[channel] += 1;
                 self.flash_remaining[channel] = self.config.flash_ms;
             }
             self.was_above_threshold[channel] = above;
@@ -301,7 +317,7 @@ pub fn compose(dynamics: &Dynamics, count: usize, look: &Look, motion: &MotionSt
             if let Some(colour) = colours.get_mut(*led as usize) {
                 let sampled =
                     palette::sample(look.palette, dynamics.level(channel, band), config.floor);
-                *colour = motion.modulate(sampled, *cell, preferred, channel, dynamics);
+                *colour = motion.modulate(sampled, *cell, half, dynamics);
             }
         }
 
@@ -747,6 +763,32 @@ mod tests {
                 "thumb {led} must still show its level when thumb_glow is on"
             );
         }
+    }
+
+    #[test]
+    fn the_beat_counter_counts_rising_edges_not_flash_frames() {
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        let mut bands = vec![0.0; BAND_COUNT];
+        bands[..BASS_BANDS].fill(0.8);
+        let hit = spectrum_with(&bands);
+        let silence = spectral_flat(BAND_COUNT, 0.0);
+
+        dynamics.update(&silence, 0.2);
+        assert_eq!(dynamics.beat_count(0), 0);
+        dynamics.update(&hit, 0.2);
+        assert_eq!(dynamics.beat_count(0), 1);
+        assert!(
+            !dynamics.is_flashing(0),
+            "at 5 fps the flash has already expired; the counter must not"
+        );
+
+        // A sustained hit is not a new rising edge.
+        dynamics.update(&hit, 0.2);
+        assert_eq!(dynamics.beat_count(0), 1);
+
+        dynamics.update(&silence, 0.2);
+        dynamics.update(&hit, 0.2);
+        assert_eq!(dynamics.beat_count(0), 2);
     }
 
     #[test]

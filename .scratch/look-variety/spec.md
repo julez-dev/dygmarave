@@ -34,7 +34,7 @@ EEPROM-backed commands, Windows/macOS.
 | Pools | Read only when the axis is `"random"`. Empty/omitted = every built-in except `none`. `none` is drawable only if listed. Unknown names and duplicates are errors. |
 | Timers | One per axis. `*_interval_s = 0` disables switching. ±25% jitter, not configurable. Draw at startup, first switch one interval later. A fixed `scatter` still resolves one permutation at startup; that is not a pool draw. |
 | Transition | One `fade_ms` for all axes (default 300, 0 = hard cut). Fade starts from the colours actually on screen; a mid-fade switch snapshots the current blend and retargets. |
-| Motion time | Periodic motions share one continuous clock; `sparkle`/`ripple` clear pending events on switch. Fades never reset phase. |
+| Motion time | Periodic motions share one continuous clock; beat-driven events consume a monotonic beat counter, not the thumb flash; `sparkle`/`ripple`/`rain` clear pending events on switch. Fades never reset phase. |
 | Seed | `--seed <u64>` CLI only; OS entropy otherwise. The effective seed is logged once at startup. `scatter` permutations derive from the same RNG. |
 | Defaults | `layout="snake"`, `palette="ember"`, `motion="none"`, all intervals 0, `fade_ms=300`. |
 | Config home | New `[look]` table. `[render]` stays signal dynamics. |
@@ -203,8 +203,8 @@ One test module per source file, per the repo convention.
 - Palette: stop positions sorted; endpoints correct; `ember` equals the old ramp
   at 1000 sampled levels; floor applies; `spectrum` may be non-monotonic.
 - Motion: `intensity = 0` identity; sweep/orbit periodicity; sparkle only on a
-  beat; ripple radius grows; rain deterministic; event reset on switch; output
-  clamped.
+  beat counter edge (including 5 fps and overlapping beats); ripple radius grows;
+  rain deterministic; event reset on switch; output clamped.
 - Look: bag covers the pool before repeating; no repeat across a reshuffle;
   jitter inside ±25%; startup draw; fixed axes never draw; seed reproducibility;
   interval 0 never switches; mid-fade retarget has no discontinuity; `fade_ms = 0`

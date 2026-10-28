@@ -58,10 +58,11 @@ Implemented on branch `look-variety`; ticket 03 is untouched.
   live state, and makes the crossfade contract obvious — compose is read-only over
   `&MotionState`.
 - **Advance once, render many.** `MotionState::advance(now, dynamics)` owns the
-  clock, glint/ripple ageing, beat rising-edge detection (`Dynamics::is_flashing`)
-  and spawn decisions. `modulate` is pure over `&self`. `reset_events` clears
-  glints/ripples and re-draws deterministic rain, but never touches `elapsed`.
-  A reset also suppresses a beat trigger from a flash already in progress.
+  clock, glint/ripple ageing, beat edge detection (`Dynamics::beat_count`) and
+  spawn decisions. `modulate` is pure over `&self`. `reset_events` clears
+  glints/ripples and re-draws rain from the continuing RNG, but never touches
+  `elapsed`. The next advance after a reset only snapshots the beat counter, so a
+  beat from before the switch cannot fire late.
 - **Fixed buffers.** 16 glint slots and 2 ripple slots per half, 4 rain droplets
   per half, all fixed-size arrays. No motion-path allocation; `advance` and
   `modulate` only do arithmetic.
@@ -71,15 +72,31 @@ Implemented on branch `look-variety`; ticket 03 is untouched.
   layout vector for the motion pass.
 - **Effects.** Sweep uses a cosine crest, `period = 3 s / speed`, floor `0.3`.
   Breathe uses `thumb_level`. Sparkle spawns 1..9 glints by intensity with an
-  exponential ~120 ms decay. Ripple scales its 600 ms life by speed and expands
-  inner→outer by depth. Orbit is a soft white blend on a 4 s/speed circle in
-  normalised coordinates, so both halves mirror. Rain has four seeded droplets per
-  half falling at `3 rows/s * speed`; reset re-draws the seeded pattern.
+  exponential ~120 ms decay. Ripple is a fixed 600 ms regardless of speed and
+  expands inner→outer by depth. Orbit is a soft white blend on a 4 s/speed circle
+  in normalised coordinates, so both halves mirror. Rain has four droplets per
+  half falling at `3 rows/s * speed`; reset draws a new pattern from the continuing
+  RNG.
 - **Thumbs.** Matrix keys are modulated during `compose`'s band loop; thumbs are
-  painted afterwards from the unchanged palette-level/white-flash path.
+  painted afterwards from the unchanged palette-level/white-flash path. Thumbs
+  keep `Dynamics::is_flashing`; only event motions use the counter.
 - **Live.** `Live` owns a default `Look` and `MotionState`, calls
   `motion.advance(now, &dynamics)` once per frame in `step`, then composes. Ticket
   03 can replace the acquisition of `now` without moving state.
 
-Validation run locally: `cargo test` (214 tests), `cargo clippy --all-targets --
+Validation run locally: `cargo test` (225 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.
+
+## Review fixes (ticket 02)
+
+- `Dynamics` now has a monotonic `beat_count(channel)` incremented exactly on the
+  existing rising edge. `is_flashing` remains the thumb flash only. `MotionState`
+  tracks the last seen count per half and spawns once per missed count, so two
+  beats inside one flash window spawn twice and a 0.2 s frame cannot miss a beat.
+- Reset/motion change leaves the seen count empty; the next advance snapshots it
+  without firing. The following beat spawns normally.
+- Ripple lifetime is fixed at 600 ms; sweep/orbit/rain remain speed-scaled.
+- Resets no longer re-seed the RNG: rain and sparkle patterns continue from the
+  live stream. Two identical seeds still reproduce the same reset sequence.
+- Geometry helpers are `pub(crate)`, `modulate` takes a `Half`, and ripple also
+  early-returns at zero intensity.

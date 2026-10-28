@@ -28,6 +28,7 @@ const RIPPLE_LIFE_S: f32 = 0.6;
 const RAIN_FALL_ROWS_PER_S: f32 = 3.0;
 const MIN_BRIGHTNESS: f32 = 0.3;
 
+const MAX_BEATS_PER_ADVANCE: u64 = 8;
 const SPARKLE_SLOTS: usize = 16;
 const RIPPLE_SLOTS: usize = 2;
 const RAIN_DROPS: usize = 4;
@@ -149,7 +150,22 @@ impl Default for MotionSettings {
 }
 
 impl MotionSettings {
+    /// Clamps the numeric knobs defensively.
+    ///
+    /// Ticket 04's config validation owns user input; these debug assertions make
+    /// a bad internal call site fail loudly in tests and debug builds instead of
+    /// letting a NaN propagate through the modulation maths.
     fn normalised(self) -> Self {
+        debug_assert!(
+            self.intensity.is_finite() && (0.0..=MAX_INTENSITY).contains(&self.intensity),
+            "motion intensity must be finite and in 0..=2, got {}",
+            self.intensity
+        );
+        debug_assert!(
+            self.speed.is_finite() && (MIN_SPEED..=MAX_SPEED).contains(&self.speed),
+            "motion speed must be finite and in 0.25..=4, got {}",
+            self.speed
+        );
         Self {
             motion: self.motion,
             intensity: self.intensity.clamp(0.0, MAX_INTENSITY),
@@ -158,7 +174,7 @@ impl MotionSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Glint {
     cell: u8,
     age: f32,
@@ -204,11 +220,13 @@ impl Rain {
 /// clock.
 pub struct MotionState {
     settings: MotionSettings,
-    seed: u64,
     rng: fastrand::Rng,
     elapsed: f32,
     last_advance: Option<Instant>,
-    was_flashing: [bool; HALVES],
+    /// The last beat count observed per half. `None` means "sync on the next
+    /// advance without firing", which suppresses a beat that happened before a
+    /// reset or motion switch.
+    seen_beats: [Option<u64>; HALVES],
     glints: [[Glint; SPARKLE_SLOTS]; HALVES],
     next_glint: [usize; HALVES],
     ripples: [[Ripple; RIPPLE_SLOTS]; HALVES],
@@ -220,17 +238,16 @@ impl MotionState {
         let settings = settings.normalised();
         let mut state = Self {
             settings,
-            seed,
             rng: fastrand::Rng::with_seed(seed),
             elapsed: 0.0,
             last_advance: None,
-            was_flashing: [false; HALVES],
+            seen_beats: [None; HALVES],
             glints: [[Glint::default(); SPARKLE_SLOTS]; HALVES],
             next_glint: [0; HALVES],
             ripples: [[Ripple::default(); RIPPLE_SLOTS]; HALVES],
             rain: [Rain::default(); HALVES],
         };
-        state.reset_events_inner(false);
+        state.reset_events();
         state
     }
 
@@ -263,22 +280,15 @@ impl MotionState {
 
     /// Clears sparkle, ripple and rain event state, leaving the clock untouched.
     ///
-    /// Also suppresses a beat trigger for a flash already in progress, so a
-    /// switch cannot spawn a fresh event from the tail of the old selection.
+    /// The next advance only snapshots the beat counters, so a beat that happened
+    /// before the switch cannot fire late. Rain is re-drawn from the continuing
+    /// RNG, so repeated switches do not replay one frozen pattern.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset_events(&mut self) {
-        self.reset_events_inner(true);
-    }
-
-    fn reset_events_inner(&mut self, suppress_current_flash: bool) {
-        self.was_flashing = [suppress_current_flash; HALVES];
+        self.seen_beats = [None; HALVES];
         self.glints = [[Glint::default(); SPARKLE_SLOTS]; HALVES];
         self.next_glint = [0; HALVES];
         self.ripples = [[Ripple::default(); RIPPLE_SLOTS]; HALVES];
-
-        // Rain's droplet pattern is deterministic from the seed. Re-drawing it is
-        // the "clear" operation for rain.
-        self.rng = fastrand::Rng::with_seed(self.seed);
         for half in 0..HALVES {
             let rain = Rain::draw(&mut self.rng, self.elapsed);
             self.rain[half] = rain;
@@ -302,16 +312,22 @@ impl MotionState {
 
         for half in 0..HALVES {
             let channel = channel_for_half(dynamics, half);
-            let flashing = dynamics.is_flashing(channel);
-            let rising = flashing && !self.was_flashing[half];
-            self.was_flashing[half] = flashing;
-            if !rising {
+            let count = dynamics.beat_count(channel);
+            let previous = self.seen_beats[half];
+            self.seen_beats[half] = Some(count);
+
+            // A reset leaves `previous` as None: snapshot the counter without
+            // firing, so only beats after the switch can spawn events.
+            let Some(previous) = previous else {
                 continue;
-            }
-            match self.settings.motion {
-                Motion::Sparkle => self.spawn_sparkle(half),
-                Motion::Ripple => self.spawn_ripple(half),
-                _ => {}
+            };
+            let hits = count.saturating_sub(previous).min(MAX_BEATS_PER_ADVANCE);
+            for _ in 0..hits {
+                match self.settings.motion {
+                    Motion::Sparkle => self.spawn_sparkle(half),
+                    Motion::Ripple => self.spawn_ripple(half),
+                    _ => {}
+                }
             }
         }
     }
@@ -331,14 +347,13 @@ impl MotionState {
                 }
             }
         }
-        let ripple_life = RIPPLE_LIFE_S / self.settings.speed;
         for half in 0..HALVES {
             for ripple in &mut self.ripples[half] {
                 if !ripple.active {
                     continue;
                 }
                 ripple.age += dt;
-                if ripple.age >= ripple_life {
+                if ripple.age >= RIPPLE_LIFE_S {
                     *ripple = Ripple::default();
                 }
             }
@@ -381,6 +396,9 @@ impl MotionState {
     }
 
     fn spawn_ripple(&mut self, half: usize) {
+        if self.settings.intensity <= 0.0 {
+            return;
+        }
         let mut slot = 0;
         let mut oldest = -1.0;
         for (index, ripple) in self.ripples[half].iter().enumerate() {
@@ -404,18 +422,13 @@ impl MotionState {
     /// Read-only: this may be called twice in one frame for a crossfade without
     /// changing any event state. The caller paints thumb LEDs separately, so this
     /// function is only ever reached for matrix keys.
-    pub fn modulate(
-        &self,
-        colour: Rgb,
-        cell: Cell,
-        half: usize,
-        channel: usize,
-        dynamics: &Dynamics,
-    ) -> Rgb {
+    pub(crate) fn modulate(&self, colour: Rgb, cell: Cell, half: Half, dynamics: &Dynamics) -> Rgb {
         if self.settings.motion == Motion::None || self.settings.intensity == 0.0 {
             return colour;
         }
 
+        let half_index = half_index(half);
+        let channel = channel_for_half(dynamics, half_index);
         match self.settings.motion {
             Motion::None => colour,
             Motion::Sweep => scale(
@@ -427,10 +440,10 @@ impl MotionState {
                 self.sweep_factor(cell.row() as f32 / (layout::ROW_COUNT - 1) as f32),
             ),
             Motion::Breathe => scale(colour, self.breathe_factor(dynamics.thumb_level(channel))),
-            Motion::Sparkle => blend_white(colour, self.sparkle_blend(half, cell.index())),
-            Motion::Ripple => blend_white(colour, self.ripple_blend(half, cell.depth())),
+            Motion::Sparkle => blend_white(colour, self.sparkle_blend(half_index, cell.index())),
+            Motion::Ripple => blend_white(colour, self.ripple_blend(half_index, cell.depth())),
             Motion::Orbit => blend_white(colour, self.orbit_blend(cell)),
-            Motion::Rain => blend_white(colour, self.rain_blend(half, cell)),
+            Motion::Rain => blend_white(colour, self.rain_blend(half_index, cell)),
         }
     }
 
@@ -461,14 +474,13 @@ impl MotionState {
     }
 
     fn ripple_blend(&self, half: usize, depth: usize) -> f32 {
-        let duration = RIPPLE_LIFE_S / self.settings.speed;
         let extent = (layout::DEPTH_COUNT - 1) as f32;
         let mut best = 0.0f32;
         for ripple in &self.ripples[half] {
             if !ripple.active {
                 continue;
             }
-            let progress = (ripple.age / duration).clamp(0.0, 1.0);
+            let progress = (ripple.age / RIPPLE_LIFE_S).clamp(0.0, 1.0);
             if progress >= 1.0 {
                 continue;
             }
@@ -516,6 +528,13 @@ impl MotionState {
 impl Default for MotionState {
     fn default() -> Self {
         Self::new(MotionSettings::default(), 0)
+    }
+}
+
+fn half_index(half: Half) -> usize {
+    match half {
+        Half::Left => 0,
+        Half::Right => 1,
     }
 }
 
@@ -641,8 +660,8 @@ mod tests {
         let inner = Cell::from_index(0).unwrap(); // (row 0, depth 0)
         let outer = Cell::from_index(3).unwrap(); // (row 0, depth 3)
         let grey = Rgb::new(120, 120, 120);
-        let inner = sweep.modulate(grey, inner, 0, 0, &dynamics);
-        let outer = sweep.modulate(grey, outer, 0, 0, &dynamics);
+        let inner = sweep.modulate(grey, inner, Half::Left, &dynamics);
+        let outer = sweep.modulate(grey, outer, Half::Left, &dynamics);
         assert!(
             inner.r > outer.r,
             "the sweep crest should start at the inner edge: {inner:?} vs {outer:?}"
@@ -652,8 +671,8 @@ mod tests {
         vertical.advance(start, &dynamics);
         let top_cell = Cell::from_index(0).unwrap(); // (row 0, depth 0)
         let second_row_cell = Cell::from_index(layout::DEPTH_COUNT).unwrap(); // (row 1, depth 0)
-        let top = vertical.modulate(grey, top_cell, 0, 0, &dynamics);
-        let second_row = vertical.modulate(grey, second_row_cell, 0, 0, &dynamics);
+        let top = vertical.modulate(grey, top_cell, Half::Left, &dynamics);
+        let second_row = vertical.modulate(grey, second_row_cell, Half::Left, &dynamics);
         assert!(
             top.r > second_row.r,
             "the vertical crest should start at the top: {top:?} vs {second_row:?}"
@@ -661,8 +680,8 @@ mod tests {
 
         // Half a period later the crest has moved down to the second row.
         vertical.advance(start + Duration::from_millis(1_500), &dynamics);
-        let top_now = vertical.modulate(grey, top_cell, 0, 0, &dynamics);
-        let second_row_now = vertical.modulate(grey, second_row_cell, 0, 0, &dynamics);
+        let top_now = vertical.modulate(grey, top_cell, Half::Left, &dynamics);
+        let second_row_now = vertical.modulate(grey, second_row_cell, Half::Left, &dynamics);
         assert!(
             second_row_now.r > top_now.r,
             "the vertical crest must travel top to bottom"
@@ -733,12 +752,15 @@ mod tests {
     fn sparkle_count_scales_with_intensity() {
         let start = Instant::now();
         let mut dynamics = quiet_dynamics();
-        dynamics.update(&beat_spectrum(), 1.0 / 30.0);
 
         let mut low = MotionState::new(settings(Motion::Sparkle, 0.25, 1.0), 7);
         let mut high = MotionState::new(settings(Motion::Sparkle, 2.0, 1.0), 7);
         low.advance(start, &dynamics);
         high.advance(start, &dynamics);
+        dynamics.update(&beat_spectrum(), 1.0 / 30.0);
+        let beat_at = start + Duration::from_millis(33);
+        low.advance(beat_at, &dynamics);
+        high.advance(beat_at, &dynamics);
         assert!(
             active_glints(&high, 0) >= active_glints(&low, 0),
             "more intensity must not spawn fewer glints"
@@ -794,9 +816,17 @@ mod tests {
         let dynamics = dynamics_with_bands(&bands);
         let start = Instant::now();
         let look = Look::default();
+        let mut baseline = MotionState::default();
+        baseline.advance(start, &dynamics);
+        let baseline_frame = compose(&dynamics, 132, &look, &baseline);
+
         let mut state = MotionState::new(settings(Motion::Orbit, 1.0, 1.0), 3);
         state.advance(start, &dynamics);
         let frame = compose(&dynamics, 132, &look, &state);
+        assert_ne!(
+            frame, baseline_frame,
+            "the orbit test must fail if orbit modulates nothing"
+        );
 
         let left = layout::band_cells_for(&look.layout, Half::Left);
         let right = layout::band_cells_for(&look.layout, Half::Right);
@@ -861,11 +891,14 @@ mod tests {
         assert_eq!(state.elapsed, elapsed, "reset must not reset the clock");
         assert_eq!(active_glints(&state, 0), 0);
         assert_eq!(active_ripples(&state, 0), 0);
-        assert!(state.was_flashing.iter().all(|flashing| *flashing));
+        assert!(state.seen_beats.iter().all(Option::is_none));
 
-        // A resettled ripple is also cleared on reset.
+        // A started ripple is also cleared on reset.
+        let mut quiet = quiet_dynamics();
         let mut ripple = MotionState::new(settings(Motion::Ripple, 1.0, 1.0), 11);
-        ripple.advance(start, &dynamics);
+        ripple.advance(start, &quiet);
+        quiet.update(&beat_spectrum(), 1.0 / 30.0);
+        ripple.advance(start + Duration::from_millis(33), &quiet);
         assert_eq!(active_ripples(&ripple, 0), 1);
         ripple.reset_events();
         assert_eq!(active_ripples(&ripple, 0), 0);
@@ -902,7 +935,7 @@ mod tests {
         for motion in [Motion::Sparkle, Motion::Ripple, Motion::Orbit, Motion::Rain] {
             let mut state = MotionState::new(settings(motion, 2.0, 1.0), 1);
             state.advance(start, &dynamics);
-            let out = state.modulate(white, cell, 0, 0, &dynamics);
+            let out = state.modulate(white, cell, Half::Left, &dynamics);
             assert_eq!(out, white, "{motion} must not overflow white");
         }
         assert_eq!(
@@ -916,17 +949,27 @@ mod tests {
     fn motion_never_touches_the_thumbs() {
         let start = Instant::now();
         let mut dynamics = quiet_dynamics();
-        dynamics.update(&beat_spectrum(), 1.0 / 30.0);
         let look = Look::default();
 
+        // Sync every state before the beat so event motions actually have events.
         let mut baseline = MotionState::default();
         baseline.advance(start, &dynamics);
+        let mut states: Vec<_> = Motion::ALL
+            .into_iter()
+            .map(|motion| (motion, MotionState::new(settings(motion, 1.5, 1.0), 5)))
+            .collect();
+        for (_, state) in &mut states {
+            state.advance(start, &dynamics);
+        }
+
+        dynamics.update(&beat_spectrum(), 1.0 / 30.0);
+        let beat_at = start + Duration::from_millis(33);
+        baseline.advance(beat_at, &dynamics);
         let expected = compose(&dynamics, 132, &look, &baseline);
 
-        for motion in Motion::ALL {
-            let mut state = MotionState::new(settings(motion, 1.5, 1.0), 5);
-            state.advance(start, &dynamics);
-            let frame = compose(&dynamics, 132, &look, &state);
+        for (motion, state) in &mut states {
+            state.advance(beat_at, &dynamics);
+            let frame = compose(&dynamics, 132, &look, state);
             for half in [Half::Left, Half::Right] {
                 for led in layout::thumb_leds(half) {
                     assert_eq!(
@@ -936,5 +979,266 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn event_motions_see_a_beat_at_low_frame_rate() {
+        // At the 5 fps floor the flash timer expires inside the same 0.2 s frame,
+        // and it is already gone at 0.1 s; `is_flashing` is false by the time
+        // motion advances in both cases.
+        for frame_ms in [100u64, 200] {
+            let start = Instant::now();
+            let mut dynamics = quiet_dynamics();
+            let mut state = MotionState::new(settings(Motion::Sparkle, 1.0, 1.0), 21);
+            state.advance(start, &dynamics);
+
+            dynamics.update(&beat_spectrum(), frame_ms as f32 / 1_000.0);
+            assert!(
+                !dynamics.is_flashing(0),
+                "the flash should have expired within a {frame_ms} ms frame"
+            );
+            assert_eq!(dynamics.beat_count(0), 1);
+
+            state.advance(start + Duration::from_millis(frame_ms), &dynamics);
+            assert!(
+                active_glints(&state, 0) > 0,
+                "the beat counter must spawn glints even when the flash expired                  within a {frame_ms} ms frame"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_beats_each_spawn_an_event() {
+        let start = Instant::now();
+        let mut dynamics = quiet_dynamics();
+        let mut state = MotionState::new(settings(Motion::Ripple, 1.0, 1.0), 22);
+        state.advance(start, &dynamics);
+
+        // Two beat cycles inside one flash window. The first beat leaves the
+        // flash true, so only a counter can see the second one.
+        for _ in 0..2 {
+            dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.05);
+            dynamics.update(&beat_spectrum(), 0.05);
+        }
+        assert_eq!(dynamics.beat_count(0), 2);
+        assert!(dynamics.is_flashing(0), "both beats are inside one flash");
+
+        state.advance(start + Duration::from_millis(200), &dynamics);
+        assert_eq!(
+            active_ripples(&state, 0),
+            2,
+            "each beat must spawn its own ripple"
+        );
+    }
+
+    #[test]
+    fn a_beat_before_reset_does_not_fire_late_and_the_next_beat_does() {
+        let start = Instant::now();
+        let mut dynamics = quiet_dynamics();
+        let mut state = MotionState::new(settings(Motion::Sparkle, 2.0, 1.0), 23);
+        state.advance(start, &dynamics);
+        dynamics.update(&beat_spectrum(), 0.05);
+        state.advance(start + Duration::from_millis(50), &dynamics);
+        assert!(active_glints(&state, 0) > 0);
+
+        state.reset_events();
+        assert_eq!(active_glints(&state, 0), 0);
+
+        // This advance only snapshots the count that was already there.
+        state.advance(start + Duration::from_millis(100), &dynamics);
+        assert_eq!(
+            active_glints(&state, 0),
+            0,
+            "a beat from before the switch must not fire late"
+        );
+
+        // The next real beat after the sync does fire.
+        dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.05);
+        dynamics.update(&beat_spectrum(), 0.05);
+        state.advance(start + Duration::from_millis(150), &dynamics);
+        assert!(
+            active_glints(&state, 0) > 0,
+            "the next beat after reset must spawn"
+        );
+    }
+
+    #[test]
+    fn mono_capture_spawns_on_both_halves() {
+        let start = Instant::now();
+        let mut dynamics = quiet_dynamics();
+        let mut sparkle = MotionState::new(settings(Motion::Sparkle, 1.0, 1.0), 24);
+        let mut ripple = MotionState::new(settings(Motion::Ripple, 1.0, 1.0), 24);
+        sparkle.advance(start, &dynamics);
+        ripple.advance(start, &dynamics);
+
+        dynamics.update(&beat_spectrum(), 1.0 / 30.0);
+        let beat_at = start + Duration::from_millis(33);
+        sparkle.advance(beat_at, &dynamics);
+        ripple.advance(beat_at, &dynamics);
+
+        for half in 0..HALVES {
+            assert!(
+                active_glints(&sparkle, half) > 0,
+                "mono sparkle must reach half {half}"
+            );
+            assert_eq!(
+                active_ripples(&ripple, half),
+                1,
+                "mono ripple must reach half {half}"
+            );
+        }
+    }
+
+    #[test]
+    fn ripple_lifetime_is_fixed_against_speed() {
+        for speed in [0.25, 4.0] {
+            let start = Instant::now();
+            let mut dynamics = quiet_dynamics();
+            let mut state = MotionState::new(settings(Motion::Ripple, 1.0, speed), 25);
+            state.advance(start, &dynamics);
+            dynamics.update(&beat_spectrum(), 1.0 / 30.0);
+            let beat_at = start + Duration::from_millis(33);
+            state.advance(beat_at, &dynamics);
+            assert_eq!(active_ripples(&state, 0), 1);
+
+            state.advance(beat_at + Duration::from_millis(599), &dynamics);
+            assert_eq!(
+                active_ripples(&state, 0),
+                1,
+                "ripple must ignore speed at 599 ms"
+            );
+            state.advance(beat_at + Duration::from_millis(601), &dynamics);
+            assert_eq!(
+                active_ripples(&state, 0),
+                0,
+                "ripple must end at 600 ms despite speed"
+            );
+        }
+    }
+
+    #[test]
+    fn resets_do_not_replay_the_same_rain_pattern() {
+        let start = Instant::now();
+        let dynamics = quiet_dynamics();
+        let mut state = MotionState::new(settings(Motion::Rain, 1.0, 1.0), 42);
+        state.advance(start, &dynamics);
+        let first = state.rain[0].drops;
+        state.reset_events();
+        let second = state.rain[0].drops;
+        assert_ne!(first, second, "a reset must draw a new rain pattern");
+
+        // The same seed and reset sequence still reproduce exactly.
+        let mut a = MotionState::new(settings(Motion::Rain, 1.0, 1.0), 42);
+        let mut b = MotionState::new(settings(Motion::Rain, 1.0, 1.0), 42);
+        a.advance(start, &dynamics);
+        b.advance(start, &dynamics);
+        a.reset_events();
+        b.reset_events();
+        a.reset_events();
+        b.reset_events();
+        assert_eq!(a.rain[0].drops, b.rain[0].drops);
+        assert_eq!(a.rain[1].drops, b.rain[1].drops);
+    }
+
+    #[test]
+    fn resets_do_not_replay_the_same_sparkle_pattern() {
+        let start = Instant::now();
+        let mut dynamics = quiet_dynamics();
+        let mut state = MotionState::new(settings(Motion::Sparkle, 2.0, 1.0), 43);
+        state.advance(start, &dynamics);
+        dynamics.update(&beat_spectrum(), 0.05);
+        state.advance(start + Duration::from_millis(50), &dynamics);
+        let first = state.glints[0];
+
+        state.reset_events();
+        state.advance(start + Duration::from_millis(100), &dynamics); // sync
+        dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.05);
+        dynamics.update(&beat_spectrum(), 0.05);
+        state.advance(start + Duration::from_millis(150), &dynamics);
+        let second = state.glints[0];
+        assert_ne!(first, second, "a reset must draw new sparkle keys");
+
+        // Identical seeds and sequences still match.
+        let mut d = quiet_dynamics();
+        let mut a = MotionState::new(settings(Motion::Sparkle, 2.0, 1.0), 43);
+        let mut b = MotionState::new(settings(Motion::Sparkle, 2.0, 1.0), 43);
+        a.advance(start, &d);
+        b.advance(start, &d);
+        a.reset_events();
+        b.reset_events();
+        a.advance(start + Duration::from_millis(50), &d);
+        b.advance(start + Duration::from_millis(50), &d);
+        d.update(&beat_spectrum(), 0.05);
+        a.advance(start + Duration::from_millis(100), &d);
+        b.advance(start + Duration::from_millis(100), &d);
+        assert_eq!(a.glints[0], b.glints[0]);
+    }
+
+    #[test]
+    fn sweep_and_orbit_periods_scale_with_speed() {
+        let dynamics = quiet_dynamics();
+        let start = Instant::now();
+        let cell = Cell::from_index(10).unwrap();
+
+        for speed in [0.5, 2.0] {
+            let mut sweep = MotionState::new(settings(Motion::Sweep, 1.0, speed), 1);
+            sweep.advance(start, &dynamics);
+            let initial = sweep.sweep_factor(0.25);
+            sweep.advance(start + Duration::from_secs_f32(3.0 / speed), &dynamics);
+            assert!(
+                (sweep.sweep_factor(0.25) - initial).abs() < 1e-5,
+                "sweep period must be exactly 3 s / speed at speed {speed}"
+            );
+
+            let mut orbit = MotionState::new(settings(Motion::Orbit, 1.0, speed), 1);
+            orbit.advance(start, &dynamics);
+            let initial = orbit.orbit_blend(cell);
+            orbit.advance(start + Duration::from_secs_f32(4.0 / speed), &dynamics);
+            assert!(
+                (orbit.orbit_blend(cell) - initial).abs() < 1e-5,
+                "orbit period must be exactly 4 s / speed at speed {speed}"
+            );
+        }
+    }
+
+    #[test]
+    fn rain_speed_changes_the_fall_rate() {
+        let dynamics = quiet_dynamics();
+        let start = Instant::now();
+        let mut slow = MotionState::new(settings(Motion::Rain, 1.0, 0.5), 42);
+        let mut fast = MotionState::new(settings(Motion::Rain, 1.0, 2.0), 42);
+        slow.advance(start, &dynamics);
+        fast.advance(start, &dynamics);
+        let later = start + Duration::from_millis(500);
+        slow.advance(later, &dynamics);
+        fast.advance(later, &dynamics);
+
+        let differs = (0..layout::CELL_COUNT).any(|index| {
+            let cell = Cell::from_index(index).unwrap();
+            (slow.rain_blend(0, cell) - fast.rain_blend(0, cell)).abs() > 1e-4
+        });
+        assert!(differs, "speed must change how far the rain has fallen");
+    }
+
+    #[test]
+    fn breathe_follows_the_thumb_level_through_compose() {
+        let start = Instant::now();
+        let quiet = quiet_dynamics();
+        let mut loud_bands = vec![0.8; BAND_COUNT];
+        loud_bands[..BASS_BANDS].fill(0.8);
+        let loud = dynamics_with_bands(&loud_bands);
+        let look = Look::default();
+        let mut state = MotionState::new(settings(Motion::Breathe, 1.0, 1.0), 1);
+        state.advance(start, &quiet);
+
+        // Same clock, same state: only the thumb level differs.
+        let quiet_frame = compose(&quiet, 132, &look, &state);
+        let loud_frame = compose(&loud, 132, &look, &state);
+        let led = layout::band_leds(Half::Left)[0] as usize;
+        let brightness = |colour: Rgb| colour.r as u32 + colour.g as u32 + colour.b as u32;
+        assert!(
+            brightness(loud_frame[led]) > brightness(quiet_frame[led]),
+            "breathe must follow the thumb level through compose"
+        );
     }
 }
