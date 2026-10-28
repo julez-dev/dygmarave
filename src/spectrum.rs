@@ -80,6 +80,7 @@ impl BandPlan {
     }
 
     /// The project defaults: 28 bands, 40 Hz–16 kHz.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn standard(sample_rate: u32, fft_size: usize) -> Self {
         Self::new(sample_rate, fft_size, BAND_COUNT, LOW_HZ, HIGH_HZ)
     }

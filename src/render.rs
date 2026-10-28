@@ -63,6 +63,13 @@ pub struct DynamicsConfig {
     pub beat_release_ms: f32,
     /// How long the white flash lasts after a beat, in milliseconds.
     pub flash_ms: f32,
+    /// Whether the thumb clusters glow with their channel's level.
+    pub thumb_glow: bool,
+    /// Whether the thumb clusters flash white on a beat.
+    pub beat_flash: bool,
+    /// Levels below this are drawn black, so silence goes dark. The spec's default
+    /// is 0.02; configurable so a user can raise it on a dim board.
+    pub floor: f32,
 }
 
 impl Default for DynamicsConfig {
@@ -76,6 +83,9 @@ impl Default for DynamicsConfig {
             beat_threshold: 2.0,
             beat_release_ms: 500.0,
             flash_ms: 80.0,
+            thumb_glow: true,
+            beat_flash: true,
+            floor: FLOOR,
         }
     }
 }
@@ -239,18 +249,27 @@ impl Dynamics {
 /// The ramp reaches pure white only at 1.0, which the AGC never asks for, so a
 /// loud track stays orange rather than becoming a wall of white.
 ///
-/// Levels below [`ramp::FLOOR`] are black. A decaying band approaches zero
+/// The default black floor. The config's `render.floor` can override it.
+pub const FLOOR: f32 = 0.02;
+
+/// Levels below [`FLOOR`] are black. A decaying band approaches zero
 /// asymptotically and never arrives, so without a floor a stalled stream would
 /// leave a faint red glow on the board forever instead of going dark — which is
 /// exactly what the "silence leaves the board dark" criterion forbids.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn ramp(level: f32) -> Rgb {
+    ramp_with_floor(level, FLOOR)
+}
+
+/// [`ramp`] with a configurable black floor.
+pub fn ramp_with_floor(level: f32, floor: f32) -> Rgb {
     const BLACK: Rgb = Rgb::BLACK;
     const RED: Rgb = Rgb::new(255, 0, 0);
     const ORANGE: Rgb = Rgb::new(255, 128, 0);
     const WHITE: Rgb = Rgb::new(255, 255, 255);
 
     let level = level.clamp(0.0, 1.0);
-    if level < 0.02 {
+    if level < floor {
         return BLACK;
     }
 
@@ -275,6 +294,7 @@ pub fn ramp(level: f32) -> Rgb {
 /// no keys for — stay black.
 pub fn compose(dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
     let mut colours = vec![Rgb::BLACK; count];
+    let config = dynamics.config;
     for (half, preferred) in [(Half::Left, 0), (Half::Right, 1)] {
         // A mono capture feeds both halves; a stereo one feeds its own side.
         let channel = if dynamics.channels() == 1 {
@@ -287,17 +307,19 @@ pub fn compose(dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
                 break;
             }
             if let Some(colour) = colours.get_mut(*led as usize) {
-                *colour = ramp(dynamics.level(channel, band));
+                *colour = ramp_with_floor(dynamics.level(channel, band), config.floor);
             }
         }
 
         // The thumb cluster carries the channel's level, and flashes white on a
         // beat before settling back. It is deliberately separate from the matrix
         // bands so the spectrum stays readable while the thumbs carry rhythm.
-        let thumb_colour = if dynamics.is_flashing(channel) {
+        let thumb_colour = if config.beat_flash && dynamics.is_flashing(channel) {
             Rgb::new(255, 255, 255)
+        } else if config.thumb_glow {
+            ramp_with_floor(dynamics.thumb_level(channel), config.floor)
         } else {
-            ramp(dynamics.thumb_level(channel))
+            Rgb::BLACK
         };
         for led in layout::thumb_leds(half) {
             if let Some(colour) = colours.get_mut(*led as usize) {
@@ -568,6 +590,99 @@ mod tests {
                 continue;
             }
             assert_eq!(*colour, Rgb::BLACK, "underglow LED {led} must stay dark");
+        }
+    }
+
+    #[test]
+    fn a_higher_floor_blacks_a_decaying_band() {
+        // The AGC normalises a sustained signal to the target (0.7), so a quiet
+        // input alone stays lit. The floor matters during a fade: once the level
+        // decays below it, the band goes black rather than glowing faintly.
+        let config = DynamicsConfig {
+            floor: 0.5,
+            ..DynamicsConfig::default()
+        };
+        let mut dynamics = Dynamics::new(config, 1, BAND_COUNT);
+        dynamics.update(&spectral_flat(BAND_COUNT, 0.5), 1.0 / 30.0);
+        assert!(
+            dynamics.level(0, 0) > 0.5,
+            "a loud frame is above the floor"
+        );
+
+        // Fade until the level is below 0.5 but still above zero.
+        for _ in 0..20 {
+            dynamics.update(&spectral_flat(BAND_COUNT, 0.0), 1.0 / 30.0);
+        }
+        let level = dynamics.level(0, 0);
+        assert!(
+            level > 0.0 && level < 0.5,
+            "the band is mid-fade, got {level}"
+        );
+
+        let colours = compose(&dynamics, 132);
+        for led in 0..132u8 {
+            assert_eq!(
+                colours[led as usize],
+                Rgb::BLACK,
+                "LED {led} must be black below the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn thumb_glow_disabled_keeps_thumbs_dark() {
+        // With thumb_glow off — and the beat flash also off, so it cannot override —
+        // the thumbs stay black even while the bands light.
+        let config = DynamicsConfig {
+            thumb_glow: false,
+            beat_flash: false,
+            ..DynamicsConfig::default()
+        };
+        let mut dynamics = Dynamics::new(config, 2, BAND_COUNT);
+        let mut spectrum = Spectrum::new(2, BAND_COUNT);
+        spectrum.set_bands(0, &[1.0; BAND_COUNT]);
+        spectrum.set_bands(1, &[1.0; BAND_COUNT]);
+        dynamics.update(&spectrum, 1.0 / 30.0);
+
+        let colours = compose(&dynamics, 132);
+        for half in [Half::Left, Half::Right] {
+            for led in layout::thumb_leds(half) {
+                assert_eq!(
+                    colours[*led as usize],
+                    Rgb::BLACK,
+                    "thumb {led} must be dark when thumb_glow is off"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn beat_flash_disabled_suppresses_the_white_flash() {
+        // With beat_flash off but thumb_glow on, a beat leaves the thumbs at their
+        // level colour rather than flashing white. The threshold is raised so the
+        // beat detector stays quiet and only the glow branch runs.
+        let config = DynamicsConfig {
+            beat_flash: false,
+            beat_threshold: 1_000.0,
+            ..DynamicsConfig::default()
+        };
+        let mut dynamics = Dynamics::new(config, 1, BAND_COUNT);
+        let mut bands = vec![0.0; BAND_COUNT];
+        bands[..BASS_BANDS].fill(0.8);
+        dynamics.update(&spectrum_with(&bands), 1.0 / 30.0);
+
+        let colours = compose(&dynamics, 132);
+        for led in layout::thumb_leds(Half::Left) {
+            assert_ne!(
+                colours[*led as usize],
+                Rgb::new(255, 255, 255),
+                "thumb {led} must not flash white when beat_flash is off"
+            );
+            assert_ne!(
+                colours[*led as usize],
+                Rgb::BLACK,
+                "thumb {led} must still show its level when thumb_glow is on"
+            );
         }
     }
 

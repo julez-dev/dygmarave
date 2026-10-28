@@ -225,9 +225,21 @@ pub struct Live {
 }
 
 impl Live {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(config: LiveConfig, plan: BandPlan, count: usize, start: Instant) -> Self {
+        Self::with_dynamics(config, DynamicsConfig::default(), plan, count, start)
+    }
+
+    /// Creates a visualizer with explicit dynamics settings, so the config file's
+    /// render and thumb sections take effect without a rebuild.
+    pub fn with_dynamics(
+        config: LiveConfig,
+        dynamics_config: DynamicsConfig,
+        plan: BandPlan,
+        count: usize,
+        start: Instant,
+    ) -> Self {
         let bands = plan.band_count();
-        let dynamics_config = DynamicsConfig::default();
         Self {
             analyzer: Analyzer::new(plan, config.channels),
             dynamics: Dynamics::new(dynamics_config, config.channels, bands),

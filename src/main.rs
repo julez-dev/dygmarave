@@ -18,6 +18,7 @@ mod args;
 mod audio;
 mod bazecor;
 mod bench;
+mod config;
 mod layout;
 mod level;
 mod link;
@@ -64,6 +65,19 @@ fn run() -> Result<(), Box<dyn Error>> {
             .into());
     }
 
+    // Load the config, then let explicit CLI flags override it. A malformed or
+    // out-of-range file is an error here, before the board is touched.
+    let mut config = config::Config::load_default()?;
+    if let Some(port) = &args.port {
+        config.device.port = port.clone();
+    }
+    if let Some(source) = &args.source {
+        config.audio.source = source.clone();
+    }
+    if let Some(fps) = args.fps {
+        config.render.fps_target = fps;
+    }
+
     let interrupted = install_interrupt_handler(if args.probe_audio {
         "stopping"
     } else {
@@ -71,16 +85,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     })?;
 
     if args.columns || args.rows || args.gradient || args.thumb_pattern {
-        return paint_pattern(&args, &interrupted);
+        return paint_pattern(&args, &config, &interrupted);
     }
     if args.probe_audio {
-        return probe_audio(&args, &interrupted);
+        return probe_audio(&args, &config, &interrupted);
     }
     if args.live {
-        return live_visualizer(&args, &interrupted);
+        return live_visualizer(&config, &interrupted);
     }
 
-    let device = match &args.port {
+    let device = match config.port() {
         Some(port) => DygmaLink::from_port(port)?,
         None => DygmaLink::discover()?,
     };
@@ -174,8 +188,12 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 /// Paints a diagnostic pattern on the board and holds it, so its geometry can be
 /// checked by eye or in a photograph.
-fn paint_pattern(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
-    let device = match &args.port {
+fn paint_pattern(
+    args: &args::Args,
+    config: &config::Config,
+    interrupted: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
+    let device = match config.port() {
         Some(port) => DygmaLink::from_port(port)?,
         None => DygmaLink::discover()?,
     };
@@ -257,6 +275,20 @@ fn paint_pattern(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<
     Ok(())
 }
 
+/// Builds the band plan from the `[analysis]` section.
+///
+/// The window and band edges are user-tunable; `BandPlan::standard` hardcodes the
+/// project defaults, so using it here would make those keys silent no-ops.
+fn band_plan(config: &config::Config, sample_rate: u32) -> spectrum::BandPlan {
+    spectrum::BandPlan::new(
+        sample_rate,
+        config.analysis.window,
+        spectrum::BAND_COUNT,
+        config.analysis.band_min_hz,
+        config.analysis.band_max_hz,
+    )
+}
+
 /// What a probe draws while it runs.
 enum Probe {
     Level {
@@ -273,9 +305,9 @@ enum Probe {
 }
 
 impl Probe {
-    fn new(args: &args::Args, capture: &audio::Capture) -> Self {
+    fn new(config: &config::Config, args: &args::Args, capture: &audio::Capture) -> Self {
         if args.probe_spectrum {
-            let plan = spectrum::BandPlan::standard(capture.sample_rate, spectrum::FFT_SIZE);
+            let plan = band_plan(config, capture.sample_rate);
             println!(
                 "  window: {} samples ({:.1} ms), {} bands {:.0}-{:.0} Hz, log-spaced",
                 plan.fft_size(),
@@ -403,8 +435,12 @@ fn render_bands(spectrum: &spectrum::Spectrum) -> String {
 
 /// Captures the output mix and prints a live readout, so the audio path and the
 /// analysis can be checked before the renderer exists.
-fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
-    let selection = audio::choose(args.source.as_deref())?;
+fn probe_audio(
+    args: &args::Args,
+    config: &config::Config,
+    interrupted: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
+    let selection = audio::choose(config.source())?;
     println!(
         "source: {selection}{}",
         if selection.follows_default_sink() {
@@ -423,7 +459,7 @@ fn probe_audio(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dy
         "  {} channels at {} Hz, {:?}",
         capture.channels, capture.sample_rate, capture.sample_format
     );
-    let mut probe = Probe::new(args, &capture);
+    let mut probe = Probe::new(config, args, &capture);
     println!("  listening for {} s — play something…", args.seconds);
 
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
@@ -601,10 +637,10 @@ enum Detach {
 /// a reconnect keeps the original safe: the board now shows our last frame in
 /// static mode, so re-reading would capture our own output.
 fn open_session(
-    args: &args::Args,
+    config: &config::Config,
     baseline: Option<Baseline>,
 ) -> Result<(Session<DygmaLink>, String), Box<dyn Error>> {
-    let device = match &args.port {
+    let device = match config.port() {
         Some(port) => DygmaLink::from_port(port)?,
         None => DygmaLink::discover()?,
     };
@@ -738,8 +774,11 @@ fn run_frames<L: Link>(
 /// The board comes and goes: Bazecor may take the port, or the board may be
 /// unplugged. The audio pipeline stays up throughout; the outer loop waits and
 /// reopens the board when it is available again.
-fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Box<dyn Error>> {
-    let selection = audio::choose(args.source.as_deref())?;
+fn live_visualizer(
+    config: &config::Config,
+    interrupted: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
+    let selection = audio::choose(config.source())?;
     println!("source: {selection}");
 
     let (sender, receiver) = mpsc::channel();
@@ -749,9 +788,9 @@ fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Bo
         capture.channels, capture.sample_rate
     );
 
-    let plan = spectrum::BandPlan::standard(capture.sample_rate, spectrum::FFT_SIZE);
-    let config = live::LiveConfig {
-        fps: args.fps,
+    let plan = band_plan(config, capture.sample_rate);
+    let live_config = live::LiveConfig {
+        fps: config.render.fps_target,
         channels: capture.channels as usize,
     };
 
@@ -786,7 +825,7 @@ fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Bo
 
         // Try to open the board. A failure means it is unplugged or the port is
         // busy; keep the audio pipeline alive and retry with backoff.
-        let (mut session, port_name) = match open_session(args, original.clone()) {
+        let (mut session, port_name) = match open_session(config, original.clone()) {
             Ok(opened) => {
                 backoff.reset();
                 // Remember the pre-startup baseline on the first open, and keep it
@@ -808,7 +847,13 @@ fn live_visualizer(args: &args::Args, interrupted: &AtomicBool) -> Result<(), Bo
         };
 
         let count = session.led_count();
-        let mut visualizer = live::Live::new(config, plan.clone(), count, Instant::now());
+        let mut visualizer = live::Live::with_dynamics(
+            live_config,
+            config.dynamics(),
+            plan.clone(),
+            count,
+            Instant::now(),
+        );
         println!(
             "  port {port_name} — {count} LEDs, {} fps, {} bands",
             visualizer.fps(),

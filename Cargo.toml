@@ -11,6 +11,8 @@ serialport = "4"
 cpal = { version = "0.18", default-features = false, features = ["pipewire", "pulseaudio"] }
 realfft = "3.5"
 ctrlc = { version = "3", features = ["termination"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 
 [profile.release]
 strip = true

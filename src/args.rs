@@ -29,8 +29,9 @@ pub struct Args {
     pub probe_spectrum: bool,
     /// Drive the board live from whatever the speakers are playing.
     pub live: bool,
-    /// Frames per second for the live visualizer.
-    pub fps: u32,
+    /// Frames per second for the live visualizer. `None` means "use the config
+    /// file's target"; `Some` overrides it.
+    pub fps: Option<u32>,
     /// How long to probe audio for.
     pub seconds: u64,
     /// Capture device to use instead of choosing one.
@@ -52,7 +53,7 @@ impl Default for Args {
             thumb_pattern: false,
             probe_spectrum: false,
             live: false,
-            fps: 30,
+            fps: None,
             seconds: 5,
             source: None,
             help: false,
@@ -142,7 +143,7 @@ where
                 if !(1..=240).contains(&fps) {
                     return Err(format!("--fps expects 1 to 240, got {fps}"));
                 }
-                parsed.fps = fps;
+                parsed.fps = Some(fps);
             }
             "--seconds" => {
                 let value = next_value(&mut args, &flag)?;
@@ -218,8 +219,12 @@ mod tests {
     fn parses_the_live_flags() {
         let parsed = args(&["--live", "--fps", "60"]).unwrap();
         assert!(parsed.live);
-        assert_eq!(parsed.fps, 60);
-        assert_eq!(Args::default().fps, 30, "30 fps unless asked otherwise");
+        assert_eq!(parsed.fps, Some(60));
+        assert_eq!(
+            Args::default().fps,
+            None,
+            "None means use the config file's target"
+        );
     }
 
     #[test]

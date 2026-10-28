@@ -1,0 +1,51 @@
+# dygmarave configuration. Copy to ~/.config/dygmarave/config.toml (or
+# $XDG_CONFIG_HOME/dygmarave/config.toml) and edit. Every key shown here is
+# optional; uncomment only what you want to change. Command-line flags override
+# this file. A missing file means the defaults; a malformed file is an error.
+
+[device]
+# "auto" finds the board by USB identity. An explicit path skips discovery.
+port = "auto"
+# port = "/dev/ttyACM0"
+
+[audio]
+# Empty means the default sink's monitor. A name selects a specific source.
+source = ""
+
+[analysis]
+# FFT window in samples. Must be a non-zero power of two. 1024 at 48 kHz is
+# ~21 ms, responsive enough for the beat to land on time.
+window = 1024
+# Band edges in Hz. 28 bands are laid out log-spaced between these.
+band_min_hz = 40.0
+band_max_hz = 16000.0
+
+[render]
+# Frames per second to target. 30 is smooth to the eye; the daemon lowers it
+# automatically when the board cannot keep up.
+fps_target = 30
+# Attack curve. Only "instant" is supported.
+attack = "instant"
+# Fade time constant in milliseconds. Higher decays slower and looks smoother.
+decay_ms = 180.0
+# Gate in dBFS. Below this a channel is treated as silent and its LEDs go dark.
+gate_db = -55.0
+# AGC peak-tracker time constant in milliseconds. Higher adapts to the music's
+# loudness more slowly.
+agc_release_ms = 4000.0
+# AGC ceiling. Under 1.0 so loud material stays below white.
+target = 0.7
+# AGC gain ceiling, so near-silence is not amplified without limit.
+max_gain = 100.0
+# Levels below this are drawn black, so silence goes dark. Raise it on a dim
+# board; lower it to show fainter detail.
+floor = 0.02
+
+[thumbs]
+# Glow the thumb clusters with their channel's level.
+level = true
+# Flash the thumb clusters white on a bass beat.
+beat_flash = true
+# How much louder than the rolling average a beat must be to flash. Higher is
+# more selective.
+beat_threshold = 2.0
