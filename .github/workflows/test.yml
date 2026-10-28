@@ -33,11 +33,13 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-  # Build on 22.04 (glibc 2.35) so the artifact runs on Debian 12 / Ubuntu
-  # 22.04 and newer, not only on the current ubuntu-latest image.
+  # libspa 0.10.1 expects newer SPA headers than Ubuntu 22.04 ships (it uses
+  # spa_meta_region_is_valid, spa_meta_first and spa_video_info_raw.flags),
+  # so 22.04 cannot build it. Build on 24.04 (glibc 2.39); the artifact runs
+  # on Ubuntu 24.04+ / Fedora 40+ / current Arch.
   build:
     needs: test
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
