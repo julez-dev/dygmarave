@@ -13,7 +13,9 @@ it owns the fade state so `render::compose` stays pure.
 ## Acceptance criteria
 
 - [ ] `look::AxisSettings<T>` (or equivalent) carries a fixed value or a random
-      pool plus an interval. Fixed axes never draw and never schedule.
+      pool plus an interval. Fixed axes never draw from their pool/bag and never
+      schedule. A fixed `LayoutKind::Scatter` still resolves one permutation from
+      the run RNG at startup; that is resolution, not a pool draw.
 - [ ] A random axis draws at startup, before the first frame; the first switch
       happens one full interval later. Interval 0 draws once and never switches.
 - [ ] Each axis has an independent deadline. Jitter is uniform in ±25% of the

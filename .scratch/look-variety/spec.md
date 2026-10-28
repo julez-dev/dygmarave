@@ -32,7 +32,7 @@ EEPROM-backed commands, Windows/macOS.
 | Thumbs | Always level + white beat flash; level glow uses the active palette; motion never touches them; thumbs fade with the frame. |
 | Selection | Fixed name or `"random"`. Random draws from a pool without replacement (shuffle bag); reshuffles at exhaustion, avoiding an immediate repeat across the boundary. |
 | Pools | Read only when the axis is `"random"`. Empty/omitted = every built-in except `none`. `none` is drawable only if listed. Unknown names and duplicates are errors. |
-| Timers | One per axis. `*_interval_s = 0` disables switching. ±25% jitter, not configurable. Draw at startup, first switch one interval later. |
+| Timers | One per axis. `*_interval_s = 0` disables switching. ±25% jitter, not configurable. Draw at startup, first switch one interval later. A fixed `scatter` still resolves one permutation at startup; that is not a pool draw. |
 | Transition | One `fade_ms` for all axes (default 300, 0 = hard cut). Fade starts from the colours actually on screen; a mid-fade switch snapshots the current blend and retargets. |
 | Motion time | Periodic motions share one continuous clock; `sparkle`/`ripple` clear pending events on switch. Fades never reset phase. |
 | Seed | `--seed <u64>` CLI only; OS entropy otherwise. The effective seed is logged once at startup. `scatter` permutations derive from the same RNG. |
@@ -176,9 +176,10 @@ Startup logging: `seed=…` once, then one line per switch:
 - **`src/look.rs`** (new) — axis enums and name parsing, pools, shuffle bags,
   jittered deadlines, fade state, seed/RNG (`fastrand`).
 - **`src/palette.rs`** (new) — named ramp stop tables and interpolation; `Rgb::lerp`.
-- **`src/layout.rs`** — `Layout` enum and `band_leds_for(Layout, Half)`; keep the
-  existing `band_leds` as the `snake` path or replace its call sites. Geometry
-  tests for permutation and mirroring.
+- **`src/layout.rs`** — `LayoutKind` (names, `ALL`, `from_name`, `resolve`) plus the
+  resolved `Layout` and `band_leds_for(&Layout, Half)`; keep the existing
+  `band_leds` as the `snake` path or replace its call sites. Geometry tests for
+  permutation and mirroring.
 - **`src/render.rs`** — `compose` takes a selection (layout, palette, motion) and a
   clock; motion functions; blur/glint helpers. `Dynamics`, `Pacer` unchanged.
 - **`src/config.rs`** — `[look]` struct, defaults, validation, mapping to the

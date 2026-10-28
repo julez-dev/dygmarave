@@ -7,15 +7,15 @@ configured in code to show any layout with any palette, but still uses
 
 **Blocked by:** none
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## Acceptance criteria
 
 - [x] `layout::LayoutKind` names all eight layouts: `snake`, `vertical-snake`,
       `rows`, `columns`, `rings`, `diagonal`, `spiral`, `scatter`. Names parse from
-      and render to the config spelling; resolving a kind is the only way to get a
-      concrete `layout::Layout`.
-- [x] `layout::band_leds_for(Layout, Half)` returns one LED per band for the
+      and render to the config spelling. `LayoutKind` is the name layer; a
+      `Scatter` cannot be constructed without drawing a permutation.
+- [x] `layout::band_leds_for(&Layout, Half)` returns one LED per band for the
       active layout. `Layout::Snake` reproduces the current `band_leds` output
       exactly (byte-identical LED vectors on both halves).
 - [x] The other geometric layouts are deterministic, mirrored across halves, and
@@ -64,8 +64,9 @@ Implemented on branch `look-variety`; ticket 02 is untouched.
 
 - **Layout API (review fix).** Names live in `layout::LayoutKind`, which is
   `Copy` and has `ALL`, `NAMES`, `name`, `from_name`, `Display` and `FromStr`.
-  `LayoutKind::resolve(&mut fastrand::Rng)` is the only way to obtain a concrete
-  `layout::Layout`. Resolving `Scatter` always calls `Scatter::draw`; there is no
+  `LayoutKind::resolve(&mut fastrand::Rng)` is the only name-driven constructor
+  for a concrete `layout::Layout`; a `Scatter` cannot be constructed without
+  `Scatter::draw`. Resolving `Scatter` therefore always draws; there is no
   identity/row-major scatter to fall into by accident. `Layout` is a
   data-carrying enum because scatter holds its frozen permutation, and
   `band_leds_for` takes `&Layout` so both halves can render that frozen value
@@ -95,3 +96,16 @@ Implemented on branch `look-variety`; ticket 02 is untouched.
 
 Validation run locally: `cargo test` (199 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.
+
+
+## Controller acceptance
+
+Review round 1 found one blocker: `Layout::from_name("scatter")` produced a
+row-major identity permutation. Fixed in `df3c974` by splitting `LayoutKind`
+(names) from the resolved `Layout`; the blocker is now unrepresentable.
+
+Review round 2 verdict: **ACCEPT** — no remaining blocker. Deferred non-blocker:
+the Ice thumb tests are discriminating at the current thumb level (~0.7) but
+would go vacuous if the level ever reached 1.0, where Ice and Ember are both
+white. Add a `sample(Ice) != sample(Ember)` guard when the thumb tests are next
+touched. The per-frame permutation recompute is explicitly deferred to ticket 03.

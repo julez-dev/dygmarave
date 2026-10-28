@@ -350,7 +350,7 @@ impl fmt::Display for LayoutKind {
 ///
 /// `scatter` carries its frozen permutation. There is deliberately no way to
 /// construct a scatter without drawing one: [`LayoutKind::resolve`] is the only
-/// public constructor, and [`Scatter::draw`] is the only way it makes one.
+/// name-driven constructor, and [`Scatter::draw`] is the only way it makes one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
     #[default]
