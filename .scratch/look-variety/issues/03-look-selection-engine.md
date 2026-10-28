@@ -58,6 +58,10 @@ it owns the fade state so `render::compose` stays pure.
 - Store a `LayoutKind` in the settings and call `LayoutKind::resolve(&mut rng)`
   once when a selection is drawn. Cache the resolved band table for the turn;
   never redraw scatter or recompute the permutation per frame.
+- On a live motion switch, use `MotionState::set_motion_at`/`set_settings_at` with
+  the current `Dynamics` before the frame's `motion.advance`. Do not call the
+  plain startup setters; make them test-only or remove them as part of this
+  ticket so the swallowed-beat trap cannot return.
 - `render::compose(dynamics, count, look, &motion)` already takes `MotionState`
   explicitly. Reuse one state per engine, not a new state per frame; the engine
   owns motion scheduling/logging and calls `advance` exactly once per frame.

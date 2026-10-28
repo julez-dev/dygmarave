@@ -8,7 +8,7 @@ clock and by the existing beat/level signals.
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## Acceptance criteria
 
@@ -116,3 +116,18 @@ Validation run locally: `cargo test` (227 tests), `cargo clippy --all-targets --
   intermediate advance) → advance, and prove a pre-switch beat cannot fire late.
   The overlapping-beats test now uses 10 ms dynamics steps and asserts the flash
   is still active after each beat, so it fails if gating reverts to flash edges.
+
+
+## Controller acceptance
+
+Review round 1 found one blocker: `sparkle`/`ripple` were gated on
+`Dynamics::is_flashing`, which is already false at the 5 fps floor and merges
+overlapping beats. Fixed in `7acda62` with a monotonic per-channel
+`Dynamics::beat_count`; `MotionState` now consumes counter edges. `6d18022`
+snapshots the counter at reset time so a switch cannot swallow the next beat.
+
+Review round 2 verdict: **ACCEPT** — no blockers. Carry-over to ticket 03: the
+plain `set_motion`/`set_settings` setters still use the startup reset and would
+reintroduce the swallowed-beat bug if called live. Ticket 03 must use the `_at`
+variants on live switches, and should make the plain setters test-only or
+otherwise unrepresentable there. The unresolved API trap is not live today.
