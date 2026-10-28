@@ -8,7 +8,7 @@ it owns the fade state so `render::compose` stays pure.
 
 **Blocked by:** 01, 02
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## Acceptance criteria
 
@@ -148,3 +148,24 @@ Validation run locally: `cargo test` (246 tests), `cargo clippy --all-targets --
 
 Validation run locally: `cargo test` (248 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.
+
+
+## Controller acceptance
+
+Review round 1 found one blocker: `Bag`'s first draw was unshuffled, so the
+startup selection ignored the seed and an interval-zero random axis was identical
+across seeds. Fixed in `d76b273`. Round 1 also requested breaking the
+look↔render and render↔motion module cycles; fixed in `ce6bc70` by moving
+`Dynamics`/`DynamicsConfig`/`BASS_BANDS` to `src/dynamics.rs` and making
+`render::compose_bands` the single render primitive over cached band tables.
+
+Review round 2 verdict: **ACCEPT** — no blockers. The production module graph is
+acyclic (dynamics ← motion ← render ← look ← live). One nit remains deferred: the
+motion test module still imports `render::compose`, so the *test* graph has a
+motion→render edge. No production impact; move those full-frame assertions when
+the motion tests are next touched.
+
+Engine behaviour accepted: seeded shuffle bags, interval-zero startup draws,
+fresh scatter per draw, cached band tables, jittered independent timers, no-op
+suppression, fade-from-displayed with mid-fade retarget, exact fade completion,
+`fade_ms = 0` cut, motion `_at` reset, and the unchanged v0.1 default frame.
