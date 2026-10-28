@@ -795,8 +795,12 @@ motions = ["none", "sweep"]
                 "look.motion_interval_s",
             ),
             ("[look]\nfade_ms = 2001\n", "look.fade_ms"),
+            ("[look]\nfade_ms = -1\n", "look.fade_ms"),
             ("[look]\nfade_ms = -1.0\n", "look.fade_ms"),
             ("[look]\nfade_ms = 300.5\n", "look.fade_ms"),
+            ("[look]\nfade_ms = nan\n", "look.fade_ms"),
+            ("[look]\nfade_ms = inf\n", "look.fade_ms"),
+            ("[look]\nfade_ms = -inf\n", "look.fade_ms"),
             ("[look]\nmotion_intensity = 2.1\n", "look.motion_intensity"),
             ("[look]\nmotion_intensity = -0.1\n", "look.motion_intensity"),
             ("[look]\nmotion_intensity = nan\n", "look.motion_intensity"),
@@ -812,6 +816,16 @@ motions = ["none", "sweep"]
                 message.contains(key),
                 "expected {key:?} in {message:?} for {toml:?}"
             );
+        }
+    }
+
+    #[test]
+    fn fade_ms_accepts_integer_and_whole_float_forms() {
+        for value in ["2000", "2000.0"] {
+            let toml = format!("[look]\nfade_ms = {value}\n");
+            let config: Config = toml::from_str(&toml).expect("valid toml");
+            config.validate().expect("2000 is in range");
+            assert_eq!(config.look_settings().fade_ms, 2_000, "{value}");
         }
     }
 

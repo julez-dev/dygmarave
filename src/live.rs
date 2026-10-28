@@ -22,6 +22,8 @@
 //! safety valve, when the queue is far larger than a frame's worth.
 
 use std::sync::mpsc::Receiver;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::audio::Block;
@@ -50,6 +52,38 @@ impl Default for LiveConfig {
     }
 }
 
+/// Where the live loop writes its per-switch lines.
+///
+/// Production writes to stderr; tests can capture the lines without touching the
+/// audio path.
+#[derive(Debug, Clone)]
+pub enum LiveLog {
+    Stderr,
+    #[cfg(test)]
+    Buffer(Arc<Mutex<Vec<String>>>),
+}
+
+impl LiveLog {
+    /// Formats at the sink, so the production path does not allocate a separate
+    /// `String` per switch.
+    fn switch(&self, switch: &Switch) {
+        match self {
+            LiveLog::Stderr => eprintln!("{switch}"),
+            #[cfg(test)]
+            LiveLog::Buffer(lines) => lines
+                .lock()
+                .expect("test log lock")
+                .push(switch.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    fn buffer() -> (Self, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        (Self::Buffer(Arc::clone(&lines)), lines)
+    }
+}
+
 /// Everything needed to construct the live loop, kept together so the
 /// constructor stays a named-argument shape rather than eight positional values.
 #[derive(Debug, Clone)]
@@ -59,17 +93,15 @@ pub struct LiveOptions {
     pub look: LookSettings,
     pub seed: u64,
     pub quiet: bool,
+    pub log: LiveLog,
     pub plan: BandPlan,
     pub count: usize,
     pub start: Instant,
 }
 
-/// One line per switch, suppressed by `quiet`.
-fn switch_lines(switches: &[Switch], quiet: bool) -> impl Iterator<Item = String> + '_ {
-    switches
-        .iter()
-        .filter(move |_| !quiet)
-        .map(ToString::to_string)
+/// One switch per line, suppressed by `quiet`; formatting stays at the sink.
+fn switch_lines<'a>(switches: &'a [Switch], quiet: bool) -> impl Iterator<Item = &'a Switch> + 'a {
+    switches.iter().filter(move |_| !quiet)
 }
 
 /// The period of a frame rate, never dividing by zero.
@@ -229,6 +261,8 @@ pub struct Live {
     look: LookState,
     /// Suppress the startup seed line and per-switch lines.
     quiet: bool,
+    /// Where per-switch lines go.
+    log: LiveLog,
     pacer: Pacer,
     /// Adaptive frame-rate control. Only the rate moves; spectral resolution is
     /// never reduced.
@@ -261,6 +295,7 @@ impl Live {
             look: LookSettings::default(),
             seed: 0,
             quiet: false,
+            log: LiveLog::Stderr,
             plan,
             count,
             start,
@@ -275,6 +310,7 @@ impl Live {
             look,
             seed,
             quiet,
+            log,
             plan,
             count,
             start,
@@ -285,6 +321,7 @@ impl Live {
             dynamics: Dynamics::new(dynamics, config.channels, bands),
             look: LookState::new(look, seed, start),
             quiet,
+            log,
             pacer: Pacer::new(period_of(config.fps), start),
             rate: RateControl::new(
                 RateConfig {
@@ -350,8 +387,8 @@ impl Live {
 
         // Timers may fire several axes at once; each gets its own log line.
         let switches = self.look.tick(now, &self.dynamics);
-        for line in switch_lines(&switches, self.quiet) {
-            eprintln!("{line}");
+        for switch in switch_lines(&switches, self.quiet) {
+            self.log.switch(switch);
         }
         let colours = self.look.render(now, &self.dynamics, self.leds);
         Frame::from_colors(&colours)
@@ -457,6 +494,10 @@ impl Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::LayoutKind;
+    use crate::look::AxisSettings;
+    use crate::motion::Motion;
+    use crate::palette::Palette;
 
     const SAMPLE_RATE: u32 = 48_000;
     const FFT_SIZE: usize = 1024;
@@ -622,7 +663,9 @@ mod tests {
             reason: crate::look::SwitchReason::Random,
         }];
         assert_eq!(
-            switch_lines(&one, false).collect::<Vec<_>>(),
+            switch_lines(&one, false)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             vec!["layout snake -> rings (random)".to_string()]
         );
 
@@ -647,7 +690,9 @@ mod tests {
             },
         ];
         assert_eq!(
-            switch_lines(&several, false).collect::<Vec<_>>(),
+            switch_lines(&several, false)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             vec![
                 "layout snake -> rows (random)".to_string(),
                 "palette ember -> ice (random)".to_string(),
@@ -669,6 +714,148 @@ mod tests {
         assert_eq!(switch_lines(&[switch], false).count(), 1);
     }
 
+    fn wired_live(
+        settings: LookSettings,
+        seed: u64,
+        quiet: bool,
+        log: LiveLog,
+        start: Instant,
+    ) -> Live {
+        Live::with_look(LiveOptions {
+            config: LiveConfig::default(),
+            dynamics: DynamicsConfig::default(),
+            look: settings,
+            seed,
+            quiet,
+            log,
+            plan: plan(),
+            count: 132,
+            start,
+        })
+    }
+
+    fn other<T: Clone + PartialEq>(choices: &[T], current: T) -> T {
+        choices
+            .iter()
+            .find(|choice| **choice != current)
+            .expect("the pool needs a second value")
+            .clone()
+    }
+
+    #[test]
+    fn live_step_emits_no_line_without_switches() {
+        let start = Instant::now();
+        let (log, lines) = LiveLog::buffer();
+        let mut live = wired_live(LookSettings::default(), 1, false, log, start);
+        let _ = live.step(None, start, 0);
+        let _ = live.step(None, start + Duration::from_secs(1), 0);
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "fixed axes must not log switch lines"
+        );
+    }
+
+    #[test]
+    fn live_step_emits_one_line_for_one_switch() {
+        let start = Instant::now();
+        let settings = LookSettings {
+            palette: AxisSettings::random(
+                vec![Palette::Ember, Palette::Ice],
+                Duration::from_millis(1),
+            ),
+            fade_ms: 0,
+            ..LookSettings::default()
+        };
+        let (log, lines) = LiveLog::buffer();
+        let mut live = wired_live(settings, 42, false, log, start);
+        let _ = live.step(None, start, 0);
+        assert!(lines.lock().unwrap().is_empty());
+        let before = live.look.selection();
+        let next = other(&[Palette::Ember, Palette::Ice], before.palette);
+
+        let _ = live.step(None, start + Duration::from_secs(1), 0);
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec![format!(
+                "palette {} -> {} (random)",
+                before.palette.name(),
+                next.name()
+            )]
+        );
+    }
+
+    #[test]
+    fn live_step_emits_one_line_for_each_same_tick_switch() {
+        let start = Instant::now();
+        let settings = LookSettings {
+            layout: AxisSettings::random(
+                vec![LayoutKind::Snake, LayoutKind::Rows],
+                Duration::from_millis(1),
+            ),
+            palette: AxisSettings::random(
+                vec![Palette::Ember, Palette::Ice],
+                Duration::from_millis(1),
+            ),
+            motion: AxisSettings::random(
+                vec![Motion::None, Motion::Sweep],
+                Duration::from_millis(1),
+            ),
+            fade_ms: 0,
+            ..LookSettings::default()
+        };
+        let (log, lines) = LiveLog::buffer();
+        let mut live = wired_live(settings, 43, false, log, start);
+        let _ = live.step(None, start, 0);
+        assert!(lines.lock().unwrap().is_empty());
+        let before = live.look.selection();
+
+        let next_layout = other(&[LayoutKind::Snake, LayoutKind::Rows], before.layout);
+        let next_palette = other(&[Palette::Ember, Palette::Ice], before.palette);
+        let next_motion = other(&[Motion::None, Motion::Sweep], before.motion);
+        let _ = live.step(None, start + Duration::from_secs(1), 0);
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec![
+                format!(
+                    "layout {} -> {} (random)",
+                    before.layout.name(),
+                    next_layout.name()
+                ),
+                format!(
+                    "palette {} -> {} (random)",
+                    before.palette.name(),
+                    next_palette.name()
+                ),
+                format!(
+                    "motion {} -> {} (random)",
+                    before.motion.name(),
+                    next_motion.name()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_step_quiet_suppresses_switch_lines() {
+        let start = Instant::now();
+        let settings = LookSettings {
+            palette: AxisSettings::random(
+                vec![Palette::Ember, Palette::Ice],
+                Duration::from_millis(1),
+            ),
+            fade_ms: 0,
+            ..LookSettings::default()
+        };
+        let (log, lines) = LiveLog::buffer();
+        let mut live = wired_live(settings, 44, true, log, start);
+        let _ = live.step(None, start, 0);
+        let _ = live.step(None, start + Duration::from_secs(1), 0);
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "--quiet must suppress switch lines at the Live sink"
+        );
+    }
+
     #[test]
     fn the_look_settings_seed_and_quiet_reach_the_engine() {
         use crate::look::AxisSettings;
@@ -686,6 +873,7 @@ mod tests {
             look: settings.clone(),
             seed: 87,
             quiet: true,
+            log: LiveLog::Stderr,
             plan: plan(),
             count: 132,
             start,

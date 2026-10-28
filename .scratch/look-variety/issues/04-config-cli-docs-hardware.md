@@ -135,7 +135,7 @@ Implemented on branch `look-variety`; no hardware commands were run.
 - Docs added: ADR-0005, README, glossary Layout/Palette/Motion/Switch plus
   amended Band sequence/Ramp. Hardware verification is pending above.
 
-Validation run locally: `cargo test` (262 tests), `cargo clippy --all-targets --
+Validation run locally: `cargo test` (267 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.
 
 ## Review hardening
@@ -153,3 +153,14 @@ Validation run locally: `cargo test` (262 tests), `cargo clippy --all-targets --
 - `Config::look_settings` is `pub(crate)` and keeps the validated-input
   invariant. A fixed axis with an invalid unused pool still fails on
   `look.layouts`.
+
+## Final review nits
+
+- `fade_ms` coverage now includes integer `-1`, float `-1.0`, `300.5`, `nan`,
+  `inf`, `-inf`, and `2001` as named `look.fade_ms` failures, plus valid `2000`
+  and `2000.0` mapping to `look_settings().fade_ms == 2000`.
+- `switch_lines` returns `&Switch`; formatting happens at the sink. `LiveLog`
+  defaults to stderr and can buffer lines in tests without starting audio.
+- `Live::step` is covered directly: no switches emit nothing, one switch emits one
+  exact line, three same-tick switches emit three exact lines, and quiet emits
+  none. Seed suppression and the probe path remain covered by `seed_line` tests.

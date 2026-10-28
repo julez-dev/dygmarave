@@ -888,6 +888,7 @@ fn live_visualizer(
             look: look_settings.clone(),
             seed,
             quiet: args.quiet,
+            log: live::LiveLog::Stderr,
             plan: plan.clone(),
             count,
             start: Instant::now(),
