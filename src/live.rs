@@ -306,7 +306,7 @@ impl Live {
             self.dynamics.update(&self.silent, dt);
         }
 
-        let colours = render::compose(&self.dynamics, self.leds);
+        let colours = render::compose(&self.dynamics, self.leds, &render::Look::default());
         Frame::from_colors(&colours)
     }
 

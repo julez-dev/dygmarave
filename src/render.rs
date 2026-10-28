@@ -22,8 +22,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::layout::{self, Half};
+use crate::layout::{self, Half, Layout};
 use crate::level;
+use crate::palette::{self, Palette};
 use crate::spectrum::Spectrum;
 use crate::theme::Rgb;
 
@@ -244,55 +245,40 @@ impl Dynamics {
     }
 }
 
-/// Maps a level to a colour: black, through red and orange, to white.
-///
-/// The ramp reaches pure white only at 1.0, which the AGC never asks for, so a
-/// loud track stays orange rather than becoming a wall of white.
-///
 /// The default black floor. The config's `render.floor` can override it.
+///
+/// Levels below the floor are black. A decaying band approaches zero
+/// asymptotically and never arrives, so without a floor a stalled stream would
+/// leave a faint glow on the board forever instead of going dark — which is
+/// exactly what the "silence leaves the board dark" criterion forbids.
 pub const FLOOR: f32 = 0.02;
 
-/// Levels below [`FLOOR`] are black. A decaying band approaches zero
-/// asymptotically and never arrives, so without a floor a stalled stream would
-/// leave a faint red glow on the board forever instead of going dark — which is
-/// exactly what the "silence leaves the board dark" criterion forbids.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn ramp(level: f32) -> Rgb {
-    ramp_with_floor(level, FLOOR)
+/// A fixed look: which layout places the bands and which palette colours them.
+///
+/// The default is the v0.1 look, `snake` + `ember`. Motion joins this selection
+/// in ticket 02; keeping the selection explicit here means `compose` no longer
+/// hard-codes either axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Look {
+    pub layout: Layout,
+    pub palette: Palette,
 }
 
-/// [`ramp`] with a configurable black floor.
-pub fn ramp_with_floor(level: f32, floor: f32) -> Rgb {
-    const BLACK: Rgb = Rgb::BLACK;
-    const RED: Rgb = Rgb::new(255, 0, 0);
-    const ORANGE: Rgb = Rgb::new(255, 128, 0);
-    const WHITE: Rgb = Rgb::new(255, 255, 255);
-
-    let level = level.clamp(0.0, 1.0);
-    if level < floor {
-        return BLACK;
+impl Default for Look {
+    fn default() -> Self {
+        Self {
+            layout: Layout::Snake,
+            palette: Palette::Ember,
+        }
     }
-
-    // Each segment carries its own start and width, so a boundary cannot drift
-    // from the branch that chose it: returning them together makes the two
-    // impossible to disagree.
-    let (from, to, start, span) = if level < 0.35 {
-        (BLACK, RED, 0.0, 0.35)
-    } else if level < 0.65 {
-        (RED, ORANGE, 0.35, 0.30)
-    } else {
-        (ORANGE, WHITE, 0.65, 0.35)
-    };
-    let t = ((level - start) / span).clamp(0.0, 1.0);
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Rgb::new(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b))
 }
 
 /// Paints the dynamics onto the grid: band *n* of a half lights that half's
-/// *n*-th LED, inner to outer. The thumb clusters carry their channel's level and
-/// flash on a beat. LEDs without a band — underglow and the top bands the half has
-/// no keys for — stay black.
-pub fn compose(dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
+/// *n*-th LED in the selected layout, coloured by the selected palette. The thumb
+/// clusters carry their channel's level in the same palette and flash white on a
+/// beat. LEDs without a band — underglow and the top bands the half has no keys
+/// for — stay black.
+pub fn compose(dynamics: &Dynamics, count: usize, look: &Look) -> Vec<Rgb> {
     let mut colours = vec![Rgb::BLACK; count];
     let config = dynamics.config;
     for (half, preferred) in [(Half::Left, 0), (Half::Right, 1)] {
@@ -302,12 +288,13 @@ pub fn compose(dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
         } else {
             preferred
         };
-        for (band, led) in layout::band_leds(half).iter().enumerate() {
+        for (band, led) in layout::band_leds_for(&look.layout, half).iter().enumerate() {
             if band >= dynamics.bands() {
                 break;
             }
             if let Some(colour) = colours.get_mut(*led as usize) {
-                *colour = ramp_with_floor(dynamics.level(channel, band), config.floor);
+                *colour =
+                    palette::sample(look.palette, dynamics.level(channel, band), config.floor);
             }
         }
 
@@ -317,7 +304,7 @@ pub fn compose(dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
         let thumb_colour = if config.beat_flash && dynamics.is_flashing(channel) {
             Rgb::new(255, 255, 255)
         } else if config.thumb_glow {
-            ramp_with_floor(dynamics.thumb_level(channel), config.floor)
+            palette::sample(look.palette, dynamics.thumb_level(channel), config.floor)
         } else {
             Rgb::BLACK
         };
@@ -512,7 +499,7 @@ mod tests {
                 "band {band} exceeded the AGC target: {level}"
             );
             assert_ne!(
-                ramp(level),
+                palette::sample(Palette::Ember, level, FLOOR),
                 Rgb::new(255, 255, 255),
                 "band {band} clipped to white"
             );
@@ -520,17 +507,26 @@ mod tests {
     }
 
     #[test]
-    fn the_ramp_runs_from_black_through_warm_to_white() {
-        assert_eq!(ramp(0.0), Rgb::BLACK);
-        assert_eq!(ramp(1.0), Rgb::new(255, 255, 255));
-        assert_eq!(ramp(0.4), Rgb::new(255, 21, 0));
-        assert_eq!(ramp(0.7), Rgb::new(255, 146, 36));
+    fn the_default_palette_runs_from_black_through_warm_to_white() {
+        assert_eq!(palette::sample(Palette::Ember, 0.0, FLOOR), Rgb::BLACK);
+        assert_eq!(
+            palette::sample(Palette::Ember, 1.0, FLOOR),
+            Rgb::new(255, 255, 255)
+        );
+        assert_eq!(
+            palette::sample(Palette::Ember, 0.4, FLOOR),
+            Rgb::new(255, 21, 0)
+        );
+        assert_eq!(
+            palette::sample(Palette::Ember, 0.7, FLOOR),
+            Rgb::new(255, 146, 36)
+        );
 
         // Brightness never falls as the level rises, so the picture reads as a
         // single ramp rather than reversing part way up.
         let mut previous = 0u32;
         for step in 0..=100 {
-            let colour = ramp(step as f32 / 100.0);
+            let colour = palette::sample(Palette::Ember, step as f32 / 100.0, FLOOR);
             let brightness = colour.r as u32 + colour.g as u32 + colour.b as u32;
             assert!(brightness >= previous, "ramp reversed at {step}%");
             previous = brightness;
@@ -541,15 +537,69 @@ mod tests {
     fn the_ramp_floors_a_decaying_level_to_black() {
         // A fade approaches zero without arriving; without the floor the board
         // would glow faintly red forever after the music stops.
-        assert_eq!(ramp(0.0), Rgb::BLACK);
-        assert_eq!(ramp(0.019), Rgb::BLACK);
-        assert_ne!(ramp(0.02), Rgb::BLACK);
+        assert_eq!(palette::sample(Palette::Ember, 0.0, FLOOR), Rgb::BLACK);
+        assert_eq!(palette::sample(Palette::Ember, 0.019, FLOOR), Rgb::BLACK);
+        assert_ne!(palette::sample(Palette::Ember, 0.02, FLOOR), Rgb::BLACK);
     }
 
     #[test]
     fn the_ramp_clamps_out_of_range_input() {
-        assert_eq!(ramp(-1.0), Rgb::BLACK);
-        assert_eq!(ramp(2.0), Rgb::new(255, 255, 255));
+        assert_eq!(palette::sample(Palette::Ember, -1.0, FLOOR), Rgb::BLACK);
+        assert_eq!(
+            palette::sample(Palette::Ember, 2.0, FLOOR),
+            Rgb::new(255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn the_default_look_is_the_v0_1_snake_and_ember() {
+        let look = Look::default();
+        assert_eq!(look.layout, Layout::Snake);
+        assert_eq!(look.palette, Palette::Ember);
+    }
+
+    #[test]
+    fn compose_honours_both_axes_of_the_look() {
+        // Tiny rising band energies stay below the AGC gain ceiling, so they keep
+        // distinct displayed levels. That makes either axis changing visible in
+        // the frame.
+        let mut bands = vec![0.0; BAND_COUNT];
+        for (band, energy) in bands.iter_mut().enumerate() {
+            *energy = 0.001 * (band + 1) as f32;
+        }
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        dynamics.update(&spectrum_with(&bands), 1.0 / 30.0);
+
+        let snake = compose(&dynamics, 132, &Look::default());
+        let columns = compose(
+            &dynamics,
+            132,
+            &Look {
+                layout: Layout::Columns,
+                palette: Palette::Ember,
+            },
+        );
+        let ice = compose(
+            &dynamics,
+            132,
+            &Look {
+                layout: Layout::Snake,
+                palette: Palette::Ice,
+            },
+        );
+        assert_ne!(columns, snake, "changing the layout must move the bands");
+        assert_ne!(ice, snake, "changing the palette must change the colours");
+
+        // A layout is a permutation, so the same keys are lit either way.
+        let lit = |frame: &[Rgb]| {
+            frame
+                .iter()
+                .enumerate()
+                .filter(|(_, colour)| **colour != Rgb::BLACK)
+                .map(|(led, _)| led)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lit(&columns), lit(&snake));
     }
 
     #[test]
@@ -560,7 +610,7 @@ mod tests {
         spectrum.set_bands(1, &[1.0; BAND_COUNT]);
         dynamics.update(&spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         let expected: Vec<u8> = [Half::Left, Half::Right]
             .into_iter()
             .flat_map(|half| {
@@ -619,7 +669,7 @@ mod tests {
             "the band is mid-fade, got {level}"
         );
 
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         for led in 0..132u8 {
             assert_eq!(
                 colours[led as usize],
@@ -644,7 +694,7 @@ mod tests {
         spectrum.set_bands(1, &[1.0; BAND_COUNT]);
         dynamics.update(&spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         for half in [Half::Left, Half::Right] {
             for led in layout::thumb_leds(half) {
                 assert_eq!(
@@ -671,7 +721,7 @@ mod tests {
         bands[..BASS_BANDS].fill(0.8);
         dynamics.update(&spectrum_with(&bands), 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         for led in layout::thumb_leds(Half::Left) {
             assert_ne!(
                 colours[*led as usize],
@@ -768,7 +818,7 @@ mod tests {
         for _ in 0..4 {
             dynamics.update(&spectrum, 1.0 / 30.0);
         }
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         let left_thumb = layout::thumb_leds(Half::Left)[0];
         let right_thumb = layout::thumb_leds(Half::Right)[0];
         assert_ne!(
@@ -792,7 +842,7 @@ mod tests {
         dynamics.update(&hit, 1.0 / 30.0);
         assert!(dynamics.is_flashing(0));
 
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         // The band LED for band 0 must be the ramp of the level, not white.
         let band_led = layout::band_leds(Half::Left)[0];
         assert_ne!(
@@ -823,7 +873,7 @@ mod tests {
             !dynamics.is_flashing(0),
             "the gate must stop a floor from flashing"
         );
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         for half in [Half::Left, Half::Right] {
             for led in layout::thumb_leds(half) {
                 assert_eq!(
@@ -845,7 +895,7 @@ mod tests {
         spectrum.set_bands(1, &[0.0; BAND_COUNT]);
         dynamics.update(&spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         let left_led = layout::band_leds(Half::Left)[0];
         let right_led = layout::band_leds(Half::Right)[0];
         assert_ne!(colours[left_led as usize], Rgb::BLACK);
@@ -856,7 +906,7 @@ mod tests {
     fn a_mono_capture_feeds_both_halves() {
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
         dynamics.update(&spectral_flat(BAND_COUNT, 0.5), 1.0 / 30.0);
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         for half in [Half::Left, Half::Right] {
             let led = layout::band_leds(half)[0];
             assert_ne!(colours[led as usize], Rgb::BLACK);
@@ -867,7 +917,7 @@ mod tests {
     fn a_frame_smaller_than_the_grid_does_not_panic() {
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
         dynamics.update(&spectral_flat(BAND_COUNT, 1.0), 1.0 / 30.0);
-        let colours = compose(&dynamics, 10);
+        let colours = compose(&dynamics, 10, &Look::default());
         assert_eq!(colours.len(), 10);
     }
 
@@ -957,7 +1007,7 @@ mod tests {
         let spectrum = analyzer.spectrum().expect("a full window is ready");
         dynamics.update(spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132);
+        let colours = compose(&dynamics, 132, &Look::default());
         assert!(
             colours.iter().any(|colour| *colour != Rgb::BLACK),
             "a 1 kHz tone must light the board"

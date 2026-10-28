@@ -23,6 +23,7 @@ mod layout;
 mod level;
 mod link;
 mod live;
+mod palette;
 mod render;
 mod session;
 mod spectrum;

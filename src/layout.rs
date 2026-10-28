@@ -21,6 +21,9 @@
 //! the right half's LED indices run in the opposite direction to the left's, so
 //! the two halves mirror each other. `None` means no key at that position.
 
+use std::fmt;
+use std::str::FromStr;
+
 use crate::theme::Rgb;
 
 /// Rows in the physical grid. Four letter rows plus the bottom modifier row.
@@ -141,6 +144,220 @@ impl Half {
     }
 }
 
+/// The letter grid's normalised coordinates: `row` 0–3 top to bottom, `depth`
+/// 0–6 inner to outer. Holes are data, not missing coordinates: the left half
+/// lacks `(1, 0)` and `(2, 0)`, the right half lacks `(3, 0)`.
+const LETTER_ROW_COUNT: usize = 4;
+const DEPTHS: usize = 7;
+const CELLS: usize = LETTER_ROW_COUNT * DEPTHS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cell {
+    row: u8,
+    depth: u8,
+}
+
+impl Cell {
+    const fn new(row: usize, depth: usize) -> Self {
+        Self {
+            row: row as u8,
+            depth: depth as u8,
+        }
+    }
+
+    /// The physical LED at this normalised cell, or `None` where the half has a
+    /// hole. Physical columns are mirrored: left depth 0 is column 6, right depth
+    /// 0 is column 9.
+    fn led(self, half: Half) -> Option<u8> {
+        let column = match half {
+            Half::Left => 6usize.checked_sub(self.depth as usize)?,
+            Half::Right => 9 + self.depth as usize,
+        };
+        led_at(self.row as usize, column)
+    }
+}
+
+/// Every normalised cell of the full 4×7 rectangle, row-major.
+const ALL_CELLS: [Cell; CELLS] = {
+    let mut cells = [Cell { row: 0, depth: 0 }; CELLS];
+    let mut row = 0;
+    while row < LETTER_ROW_COUNT {
+        let mut depth = 0;
+        while depth < DEPTHS {
+            cells[row * DEPTHS + depth] = Cell::new(row, depth);
+            depth += 1;
+        }
+        row += 1;
+    }
+    cells
+};
+
+/// The clockwise inward spiral over the 4×7 rectangle, starting at the inner-top
+/// cell `(0, 0)` and moving toward the outer edge along the top row.
+///
+/// Written out rather than derived: a spiral is easier to check by eye than to
+/// re-derive from a boundary walk, and the acceptance test is "visits every
+/// present key once, looks like a spiral".
+const SPIRAL_CELLS: [Cell; CELLS] = [
+    Cell::new(0, 0),
+    Cell::new(0, 1),
+    Cell::new(0, 2),
+    Cell::new(0, 3),
+    Cell::new(0, 4),
+    Cell::new(0, 5),
+    Cell::new(0, 6),
+    Cell::new(1, 6),
+    Cell::new(2, 6),
+    Cell::new(3, 6),
+    Cell::new(3, 5),
+    Cell::new(3, 4),
+    Cell::new(3, 3),
+    Cell::new(3, 2),
+    Cell::new(3, 1),
+    Cell::new(3, 0),
+    Cell::new(2, 0),
+    Cell::new(1, 0),
+    Cell::new(1, 1),
+    Cell::new(1, 2),
+    Cell::new(1, 3),
+    Cell::new(1, 4),
+    Cell::new(1, 5),
+    Cell::new(2, 5),
+    Cell::new(2, 4),
+    Cell::new(2, 3),
+    Cell::new(2, 2),
+    Cell::new(2, 1),
+];
+
+/// A frozen scatter permutation over the full 4×7 rectangle.
+///
+/// Both halves use the same normalised permutation, so the right half is the
+/// mirror image of the left; each half then filters out its own holes. Uniformly
+/// shuffling the full rectangle makes the induced order of each half's present
+/// cells a uniform permutation of those cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scatter {
+    cells: [Cell; CELLS],
+}
+
+impl Scatter {
+    /// Draws a fresh Fisher–Yates permutation from the caller's RNG.
+    ///
+    /// The caller owns the resulting [`Layout::Scatter`] for as long as it wants
+    /// that scatter to stay on screen, so the permutation is frozen rather than
+    /// regenerated per frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn draw(rng: &mut fastrand::Rng) -> Self {
+        let mut cells = ALL_CELLS;
+        for index in (1..cells.len()).rev() {
+            let swap = rng.usize(..=index);
+            cells.swap(index, swap);
+        }
+        Self { cells }
+    }
+
+    /// The row-major permutation, used only when a name is parsed without an RNG.
+    fn identity() -> Self {
+        Self { cells: ALL_CELLS }
+    }
+}
+
+/// How a half's keys are ordered into bands.
+///
+/// `scatter` carries its frozen permutation: draw one with [`Layout::scatter`]
+/// when a new scatter selection is made, then pass the same value to every frame
+/// until the next selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    #[default]
+    Snake,
+    VerticalSnake,
+    Rows,
+    Columns,
+    Rings,
+    Diagonal,
+    Spiral,
+    Scatter(Scatter),
+}
+
+impl Layout {
+    /// Every layout, in the order the spec lists them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const NAMES: [&'static str; 8] = [
+        "snake",
+        "vertical-snake",
+        "rows",
+        "columns",
+        "rings",
+        "diagonal",
+        "spiral",
+        "scatter",
+    ];
+
+    /// The config spelling.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Layout::Snake => "snake",
+            Layout::VerticalSnake => "vertical-snake",
+            Layout::Rows => "rows",
+            Layout::Columns => "columns",
+            Layout::Rings => "rings",
+            Layout::Diagonal => "diagonal",
+            Layout::Spiral => "spiral",
+            Layout::Scatter(_) => "scatter",
+        }
+    }
+
+    /// Parses a config spelling, case-sensitively.
+    ///
+    /// `"scatter"` comes back with the row-major permutation; callers that want a
+    /// fresh scatter draw it with [`Layout::scatter`] and the run RNG.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "snake" => Some(Layout::Snake),
+            "vertical-snake" => Some(Layout::VerticalSnake),
+            "rows" => Some(Layout::Rows),
+            "columns" => Some(Layout::Columns),
+            "rings" => Some(Layout::Rings),
+            "diagonal" => Some(Layout::Diagonal),
+            "spiral" => Some(Layout::Spiral),
+            "scatter" => Some(Layout::Scatter(Scatter::identity())),
+            _ => None,
+        }
+    }
+
+    /// Draws a fresh frozen scatter permutation from the run RNG.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn scatter(rng: &mut fastrand::Rng) -> Self {
+        Layout::Scatter(Scatter::draw(rng))
+    }
+}
+
+impl fmt::Display for Layout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Why a layout name was not recognised.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "unknown layout {name:?}; expected one of snake, vertical-snake, rows, columns, rings, diagonal, spiral, scatter"
+)]
+pub struct UnknownLayout {
+    pub name: String,
+}
+
+impl FromStr for Layout {
+    type Err = UnknownLayout;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::from_name(name).ok_or_else(|| UnknownLayout {
+            name: name.to_string(),
+        })
+    }
+}
+
 /// Every LED index the grid claims, in row-major order.
 pub fn key_leds() -> Vec<u8> {
     PHYSICAL_MAP
@@ -177,29 +394,74 @@ const LETTER_ROWS: std::ops::Range<usize> = 0..4;
 /// way on both halves, so the two halves are mirror images and consecutive bands
 /// are always neighbouring keys.
 pub fn band_leds(half: Half) -> Vec<u8> {
-    let inner_to_outer: Vec<usize> = match half {
-        Half::Left => (0..=6).rev().collect(),
-        Half::Right => (9..=15).collect(),
-    };
-    let outer_to_inner: Vec<usize> = match half {
-        Half::Left => (0..=6).collect(),
-        Half::Right => (9..=15).rev().collect(),
-    };
+    band_leds_for(&Layout::Snake, half)
+}
 
-    let mut leds = Vec::new();
-    for row in LETTER_ROWS {
-        let order = if row.is_multiple_of(2) {
-            &inner_to_outer
-        } else {
-            &outer_to_inner
-        };
-        for column in order {
-            if let Some(led) = led_at(row, *column) {
-                leds.push(led);
+/// The LED carrying each band on one half, in the order `layout` defines.
+///
+/// The order is expressed in normalised half coordinates and then mapped to the
+/// physical grid, so the two halves mirror each other. Holes are skipped, which
+/// is why the left half shows 26 bands and the right 27.
+pub fn band_leds_for(layout: &Layout, half: Half) -> Vec<u8> {
+    cells_in_order(layout)
+        .into_iter()
+        .filter_map(|cell| cell.led(half))
+        .collect()
+}
+
+/// The normalised cells of `layout`, before holes are skipped.
+fn cells_in_order(layout: &Layout) -> Vec<Cell> {
+    match layout {
+        Layout::Snake => {
+            let mut cells = Vec::with_capacity(CELLS);
+            for row in LETTER_ROWS {
+                if row.is_multiple_of(2) {
+                    cells.extend((0..DEPTHS).map(|depth| Cell::new(row, depth)));
+                } else {
+                    cells.extend((0..DEPTHS).rev().map(|depth| Cell::new(row, depth)));
+                }
             }
+            cells
         }
+        Layout::VerticalSnake => {
+            let mut cells = Vec::with_capacity(CELLS);
+            for depth in 0..DEPTHS {
+                if depth.is_multiple_of(2) {
+                    cells.extend(LETTER_ROWS.map(|row| Cell::new(row, depth)));
+                } else {
+                    cells.extend(LETTER_ROWS.rev().map(|row| Cell::new(row, depth)));
+                }
+            }
+            cells
+        }
+        Layout::Rows => ALL_CELLS.to_vec(),
+        Layout::Columns => {
+            let mut cells = Vec::with_capacity(CELLS);
+            for depth in 0..DEPTHS {
+                cells.extend(LETTER_ROWS.clone().map(|row| Cell::new(row, depth)));
+            }
+            cells
+        }
+        Layout::Rings => {
+            let mut cells = ALL_CELLS.to_vec();
+            cells.sort_by_key(|cell| (ring_key(*cell), cell.row, cell.depth));
+            cells
+        }
+        Layout::Diagonal => {
+            let mut cells = ALL_CELLS.to_vec();
+            cells.sort_by_key(|cell| (cell.row as u16 + cell.depth as u16, cell.row, cell.depth));
+            cells
+        }
+        Layout::Spiral => SPIRAL_CELLS.to_vec(),
+        Layout::Scatter(scatter) => scatter.cells.to_vec(),
     }
-    leds
+}
+
+/// Squared distance from the inner home-row edge: `4·depth² + (2·row − 3)²`.
+fn ring_key(cell: Cell) -> i32 {
+    let row = cell.row as i32 * 2 - 3;
+    let depth = cell.depth as i32;
+    4 * depth * depth + row * row
 }
 
 /// How many bands this half can show.
@@ -751,5 +1013,270 @@ mod tests {
             let brightest = colour.r.max(colour.g).max(colour.b);
             assert!(brightest >= 130, "column {column} is too dim: {colour}");
         }
+    }
+
+    fn all_layouts() -> Vec<Layout> {
+        let mut rng = fastrand::Rng::with_seed(0x5ca7_7e12);
+        vec![
+            Layout::Snake,
+            Layout::VerticalSnake,
+            Layout::Rows,
+            Layout::Columns,
+            Layout::Rings,
+            Layout::Diagonal,
+            Layout::Spiral,
+            Layout::scatter(&mut rng),
+        ]
+    }
+
+    /// The LEDs a half's four letter rows contain, in row-major order.
+    fn letter_keys(half: Half) -> Vec<u8> {
+        ALL_CELLS.iter().filter_map(|cell| cell.led(half)).collect()
+    }
+
+    /// A band LED expressed in the shared normalised half coordinates.
+    fn normalised(led: u8, half: Half) -> (u8, u8) {
+        let (row, column) = band_cell(led);
+        let depth = match half {
+            Half::Left => 6 - column,
+            Half::Right => column - 9,
+        };
+        (row as u8, depth as u8)
+    }
+
+    fn sequence(layout: &Layout, half: Half) -> Vec<(u8, u8)> {
+        band_leds_for(layout, half)
+            .into_iter()
+            .map(|led| normalised(led, half))
+            .collect()
+    }
+
+    #[test]
+    fn every_layout_name_round_trips() {
+        assert_eq!(Layout::NAMES.len(), 8);
+        for name in Layout::NAMES {
+            let layout: Layout = name.parse().expect("the name must parse");
+            assert_eq!(layout.name(), name);
+            assert_eq!(layout.to_string(), name);
+            assert_eq!(Layout::from_name(name).unwrap().name(), name);
+        }
+        assert_eq!(
+            "nope".parse::<Layout>(),
+            Err(UnknownLayout {
+                name: "nope".to_string()
+            })
+        );
+        assert_eq!(Layout::default(), Layout::Snake);
+    }
+
+    #[test]
+    fn the_snake_layout_is_byte_identical_to_the_v0_1_band_sequence() {
+        let left = vec![
+            6, 5, 4, 3, 2, 1, 0, // row 0: inner to outer
+            7, 8, 9, 10, 11, 12, // row 1: outer back to inner
+            18, 17, 16, 15, 14, 13, // row 2: inner to outer
+            19, 20, 21, 22, 23, 24, 25, // row 3: outer back to inner
+        ];
+        let right = vec![
+            39, 38, 37, 36, 35, 34, 33, // row 0: inner to outer
+            41, 42, 43, 44, 45, 46, 47, // row 1: outer back to inner
+            54, 53, 52, 51, 50, 49, 48, // row 2: inner to outer
+            55, 56, 57, 58, 59, 60, // row 3: outer back to inner
+        ];
+        assert_eq!(band_leds_for(&Layout::Snake, Half::Left), left);
+        assert_eq!(band_leds_for(&Layout::Snake, Half::Right), right);
+        assert_eq!(band_leds(Half::Left), left);
+        assert_eq!(band_leds(Half::Right), right);
+    }
+
+    #[test]
+    fn every_layout_is_a_permutation_of_the_present_letter_keys() {
+        for layout in all_layouts() {
+            for half in [Half::Left, Half::Right] {
+                let leds = band_leds_for(&layout, half);
+                let expected = letter_keys(half);
+                assert_eq!(
+                    leds.len(),
+                    expected.len(),
+                    "{} dropped a {} key",
+                    layout.name(),
+                    half.name()
+                );
+                assert_eq!(
+                    leds.len(),
+                    if half == Half::Left { 26 } else { 27 },
+                    "{} has the wrong capacity on the {} half",
+                    layout.name(),
+                    half.name()
+                );
+                let mut unique = leds.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                assert_eq!(
+                    unique.len(),
+                    leds.len(),
+                    "{} repeats a key on the {} half",
+                    layout.name(),
+                    half.name()
+                );
+                for led in &leds {
+                    assert!(
+                        expected.contains(led),
+                        "{} put a band on non-letter LED {led}",
+                        layout.name()
+                    );
+                    assert!(
+                        !thumb_leds(half).contains(led),
+                        "{} put a band on thumb LED {led}",
+                        layout.name()
+                    );
+                    assert!(
+                        (*led as usize) < 69,
+                        "{} put a band on underglow LED {led}",
+                        layout.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_layout_orders_the_halves_as_mirror_images() {
+        for layout in all_layouts() {
+            let mut left = sequence(&layout, Half::Left);
+            let mut right = sequence(&layout, Half::Right);
+            // The board's single asymmetric pair: left (3, inner) has no right
+            // counterpart, while the right inner column carries (1, inner) and
+            // (2, inner) where the left has holes. Everything else must mirror.
+            left.retain(|cell| *cell != (3, 0));
+            right.retain(|cell| *cell != (1, 0) && *cell != (2, 0));
+            assert_eq!(
+                left,
+                right,
+                "{} does not use the same normalised order on both halves",
+                layout.name()
+            );
+        }
+    }
+
+    #[test]
+    fn rows_and_columns_are_the_documented_orders() {
+        assert_eq!(cells_in_order(&Layout::Rows), ALL_CELLS.to_vec());
+        let mut columns = Vec::new();
+        for depth in 0..DEPTHS {
+            for row in LETTER_ROWS {
+                columns.push(Cell::new(row, depth));
+            }
+        }
+        assert_eq!(cells_in_order(&Layout::Columns), columns);
+    }
+
+    #[test]
+    fn vertical_snake_alternates_down_and_up_columns() {
+        let order = cells_in_order(&Layout::VerticalSnake);
+        assert_eq!(
+            &order[..4],
+            &[
+                Cell::new(0, 0),
+                Cell::new(1, 0),
+                Cell::new(2, 0),
+                Cell::new(3, 0)
+            ]
+        );
+        assert_eq!(
+            &order[4..8],
+            &[
+                Cell::new(3, 1),
+                Cell::new(2, 1),
+                Cell::new(1, 1),
+                Cell::new(0, 1)
+            ]
+        );
+        assert_eq!(order.len(), CELLS);
+    }
+
+    #[test]
+    fn rings_and_diagonal_sort_by_their_documented_keys() {
+        let rings = cells_in_order(&Layout::Rings);
+        for pair in rings.windows(2) {
+            let first = (ring_key(pair[0]), pair[0].row, pair[0].depth);
+            let second = (ring_key(pair[1]), pair[1].row, pair[1].depth);
+            assert!(
+                first <= second,
+                "rings order reversed: {first:?} > {second:?}"
+            );
+        }
+
+        let diagonal = cells_in_order(&Layout::Diagonal);
+        for pair in diagonal.windows(2) {
+            let first = (
+                pair[0].row as u16 + pair[0].depth as u16,
+                pair[0].row,
+                pair[0].depth,
+            );
+            let second = (
+                pair[1].row as u16 + pair[1].depth as u16,
+                pair[1].row,
+                pair[1].depth,
+            );
+            assert!(
+                first <= second,
+                "diagonal order reversed: {first:?} > {second:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_spiral_path_is_the_documented_clockwise_spiral() {
+        assert_eq!(SPIRAL_CELLS.len(), CELLS);
+        let mut seen = SPIRAL_CELLS.to_vec();
+        seen.sort_by_key(|cell| (cell.row, cell.depth));
+        let mut all = ALL_CELLS.to_vec();
+        all.sort_by_key(|cell| (cell.row, cell.depth));
+        assert_eq!(seen, all, "the spiral must visit every cell exactly once");
+        assert_eq!(SPIRAL_CELLS[0], Cell::new(0, 0), "it starts inner-top");
+        for pair in SPIRAL_CELLS.windows(2) {
+            let step = pair[0].row.abs_diff(pair[1].row) + pair[0].depth.abs_diff(pair[1].depth);
+            assert_eq!(step, 1, "the spiral path must be contiguous");
+        }
+        assert_eq!(
+            &SPIRAL_CELLS[..10],
+            &[
+                Cell::new(0, 0),
+                Cell::new(0, 1),
+                Cell::new(0, 2),
+                Cell::new(0, 3),
+                Cell::new(0, 4),
+                Cell::new(0, 5),
+                Cell::new(0, 6),
+                Cell::new(1, 6),
+                Cell::new(2, 6),
+                Cell::new(3, 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn scatter_is_seeded_and_frozen_for_the_turn() {
+        let mut rng = fastrand::Rng::with_seed(1_234);
+        let first = Layout::scatter(&mut rng);
+
+        let mut same_seed = fastrand::Rng::with_seed(1_234);
+        let repeated = Layout::scatter(&mut same_seed);
+        assert_eq!(first, repeated, "the same seed must draw the same scatter");
+        for half in [Half::Left, Half::Right] {
+            assert_eq!(
+                band_leds_for(&first, half),
+                band_leds_for(&repeated, half),
+                "a frozen scatter must keep its order"
+            );
+        }
+
+        let mut other_seed = fastrand::Rng::with_seed(4_321);
+        let different = Layout::scatter(&mut other_seed);
+        assert_ne!(first, different, "different seeds must differ");
+
+        let next = Layout::scatter(&mut rng);
+        assert_ne!(first, next, "each draw must advance the caller's RNG");
     }
 }
