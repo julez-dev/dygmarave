@@ -257,9 +257,33 @@ impl MotionState {
         self.settings
     }
 
-    /// Replaces the selection. A motion change clears event state; an intensity
-    /// or speed change does not.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Test-only view of the continuous clock, used by the look engine's switch
+    /// tests to prove periodic phase survives a motion change.
+    #[cfg(test)]
+    pub(crate) fn elapsed_seconds(&self) -> f32 {
+        self.elapsed
+    }
+
+    /// Test-only count of active sparkle/ripple events, used to prove a switch
+    /// clears event state.
+    #[cfg(test)]
+    pub(crate) fn active_event_count(&self) -> usize {
+        self.glints
+            .iter()
+            .flatten()
+            .filter(|glint| glint.active)
+            .count()
+            + self
+                .ripples
+                .iter()
+                .flatten()
+                .filter(|ripple| ripple.active)
+                .count()
+    }
+
+    /// Replaces the selection for startup/test setup. Live switches must use
+    /// [`MotionState::set_settings_at`] so the beat counter is snapshotted.
+    #[cfg(test)]
     pub fn set_settings(&mut self, settings: MotionSettings) {
         let settings = settings.normalised();
         let motion_changed = settings.motion != self.settings.motion;
@@ -281,8 +305,9 @@ impl MotionState {
         }
     }
 
-    /// Switches motion, clearing event state when the motion actually changes.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Switches motion for startup/test setup. Live switches must use
+    /// [`MotionState::set_motion_at`] so the beat counter is snapshotted.
+    #[cfg(test)]
     pub fn set_motion(&mut self, motion: Motion) {
         if motion != self.settings.motion {
             self.settings.motion = motion;

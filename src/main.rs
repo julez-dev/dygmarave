@@ -23,6 +23,7 @@ mod layout;
 mod level;
 mod link;
 mod live;
+mod look;
 mod motion;
 mod palette;
 mod render;

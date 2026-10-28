@@ -12,43 +12,43 @@ it owns the fade state so `render::compose` stays pure.
 
 ## Acceptance criteria
 
-- [ ] `look::AxisSettings<T>` (or equivalent) carries a fixed value or a random
+- [x] `look::AxisSettings<T>` (or equivalent) carries a fixed value or a random
       pool plus an interval. Fixed axes never draw from their pool/bag and never
       schedule. A fixed `LayoutKind::Scatter` still resolves one permutation from
       the run RNG at startup; that is resolution, not a pool draw.
-- [ ] A random axis draws at startup, before the first frame; the first switch
+- [x] A random axis draws at startup, before the first frame; the first switch
       happens one full interval later. Interval 0 draws once and never switches.
-- [ ] Each axis has an independent deadline. Jitter is uniform in ±25% of the
+- [x] Each axis has an independent deadline. Jitter is uniform in ±25% of the
       interval and is not configurable.
-- [ ] `Bag<T>` draws without replacement, reshuffles when exhausted, and never
+- [x] `Bag<T>` draws without replacement, reshuffles when exhausted, and never
       repeats the last draw across the reshuffle boundary. A one-element pool
       repeatedly draws that element without reshuffle churn.
-- [ ] `scatter` is regenerated from the run RNG each time the layout bag draws it,
+- [x] `scatter` is regenerated from the run RNG each time the layout bag draws it,
       then frozen for that turn.
-- [ ] The same `--seed` produces the same sequence of draws and scatter
+- [x] The same `--seed` produces the same sequence of draws and scatter
       permutations; different seeds differ.
-- [ ] `LookState` holds the current selection, the target selection, the last
+- [x] `LookState` holds the current selection, the target selection, the last
       displayed colours, and fade progress. On a switch it starts a fade from the
       last displayed colours. On a switch mid-fade it snapshots the current blend
       as the new start and restarts the fade to the new target. No discontinuity
       at either point.
-- [ ] `fade_ms = 0` cuts immediately. Fade alpha is wall-clock based, monotonic,
+- [x] `fade_ms = 0` cuts immediately. Fade alpha is wall-clock based, monotonic,
       and reaches the target exactly at the deadline. A smoothstep curve is fine;
       linear is acceptable if documented.
-- [ ] On selecting a different motion, call `MotionState::set_settings_at`/
+- [x] On selecting a different motion, call `MotionState::set_settings_at`/
       `set_motion_at` (or `reset_events_at`) with the current `Dynamics` **before**
       this frame's `motion.advance`. That clears pending `sparkle`/`ripple`/`rain`
       events, snapshots the beat counters, and leaves periodic phase continuous.
-- [ ] `MotionState` is the active motion selection plus runtime: the engine keeps
+- [x] `MotionState` is the active motion selection plus runtime: the engine keeps
       the current `Motion`/`MotionSettings` for scheduling and logging, passes the
       state explicitly to `render::compose` alongside `Look`, and advances it once
       per frame.
-- [ ] The engine exposes the switch details needed by ticket 04 for logging
+- [x] The engine exposes the switch details needed by ticket 04 for logging
       (axis, from, to, reason).
-- [ ] Tests: bag fairness/no boundary repeat, one-element pool, jitter bounds,
+- [x] Tests: bag fairness/no boundary repeat, one-element pool, jitter bounds,
       startup draw, interval 0, seed reproducibility, mid-fade retarget has no
       jump, fade completion, motion event reset.
-- [ ] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` clean.
+- [x] `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` clean.
 
 ## Notes
 
@@ -80,3 +80,44 @@ it owns the fade state so `render::compose` stays pure.
 - The live loop must remain allocation-free enough for 30 fps. Blending 132 LEDs
   is trivial; a per-frame `Vec` allocation is acceptable only if the existing
   compose path already does one.
+
+## Implementer handoff
+
+Implemented on branch `look-variety`; ticket 04 is untouched.
+
+- **Shape.** `look::LookState` owns the run RNG, three `AxisRunner`s, the current
+  `ResolvedLook`, one `MotionState`, and the fade snapshot. `Selection` is the
+  three names; `ResolvedLook` is that selection plus the resolved `Layout` and a
+  cached `(Cell, led)` table per half. `render::compose_resolved` uses those cached
+  slices, so fade frames do not rerun a layout permutation. The old
+  `render::compose` remains as a test-only simple entry point.
+- **Tick signature.** `tick(now, &Dynamics) -> Vec<Switch>` rather than
+  `tick(now)` because a live motion switch must call `set_settings_at` with the
+  current `Dynamics` before the frame's `motion.advance`. It may return several
+  switches when deadlines coincide. Startup draws emit no `Switch`; interval
+  switches carry `reason = SwitchReason::Random`.
+- **Startup and scatter.** Random axes draw once in `LookState::new` and schedule
+  one jittered interval from `now`. Interval zero draws once and never schedules.
+  A fixed `LayoutKind::Scatter` resolves once at startup. Every draw of
+  `LayoutKind::Scatter` resolves a fresh Fisher–Yates permutation; a fresh
+  scatter with the same kind is treated as a real change (from/to both
+  `"scatter"`) and fades.
+- **No-op draws.** A draw equal to the current value emits no switch and starts no
+  fade, but the bag draw and deadline reschedule still happen. One-element bags
+  return their item without consuming RNG; the timer still reschedules.
+- **Crossfade.** `LookState` keeps `last_displayed`, a `fade_from` snapshot and
+  `fade_started`. A switch snapshots the last displayed frame, applies the new
+  selection, resets motion via `set_settings_at`, and starts a smoothstep fade.
+  `fade_ms = 0` cuts. A mid-fade switch snapshots the current blend. At alpha 1
+  the snapshot is cleared. `render` allocates the composed target and reuses the
+  previous frame buffer for the returned/blended frame, so a fade frame keeps the
+  existing one-Vec-per-frame budget.
+- **Live.** `Live` owns `LookState::new(LookSettings::default(), 0, start)` for now
+  (ticket 04 supplies the real seed/settings), calls `tick` once and then
+  `render` once per frame. Plain `MotionState::set_settings`/`set_motion` are now
+  `#[cfg(test)]`; production switches can only use the `_at` variants.
+- **Not done here:** config, CLI, seed logging, switch logging and hardware pass
+  remain ticket 04.
+
+Validation run locally: `cargo test` (246 tests), `cargo clippy --all-targets --
+-D warnings`, `cargo fmt --check`.

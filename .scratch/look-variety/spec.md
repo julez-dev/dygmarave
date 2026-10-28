@@ -173,12 +173,13 @@ Startup logging: `seed=…` once, then one line per switch:
 
 ## Module plan
 
-- **`src/look.rs`** (new) — axis enums and name parsing, pools, shuffle bags,
-  jittered deadlines, fade state, seed/RNG (`fastrand`).
+- **`src/look.rs`** (new) — `Axis`, `Switch`, `AxisSettings`, `Bag`, the seeded
+  run RNG, jittered per-axis deadlines, `ResolvedLook` with a cached band table,
+  `LookState` and its crossfade.
 - **`src/motion.rs`** (new) — `Motion` name layer and `MotionState`: the
   continuous clock, fixed sparkle/ripple/rain event buffers, `advance` for state,
-  and read-only matrix modulation. `Look`/`MotionState` are the explicit selection
-  and state passed to `compose`.
+  and read-only matrix modulation. `LookState` passes a `ResolvedLook` and the
+  `MotionState` to `render::compose_resolved`.
 - **`src/palette.rs`** (new) — named ramp stop tables and interpolation; `Rgb::lerp`.
 - **`src/layout.rs`** — `LayoutKind` (names, `ALL`, `from_name`, `resolve`) plus the
   resolved `Layout` and `band_leds_for(&Layout, Half)`; keep the existing

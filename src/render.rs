@@ -22,8 +22,11 @@
 
 use std::time::{Duration, Instant};
 
-use crate::layout::{self, Half, Layout};
+#[cfg(test)]
+use crate::layout::Layout;
+use crate::layout::{self, Cell, Half};
 use crate::level;
+use crate::look::ResolvedLook;
 use crate::motion::MotionState;
 use crate::palette::{self, Palette};
 use crate::spectrum::Spectrum;
@@ -276,12 +279,14 @@ pub const FLOOR: f32 = 0.02;
 /// stored here: it carries a clock and event state, so `compose` takes an
 /// explicit `&MotionState` alongside the look. That is what lets a crossfade
 /// render two selections in one frame without advancing events twice.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Look {
     pub layout: Layout,
     pub palette: Palette,
 }
 
+#[cfg(test)]
 impl Default for Look {
     fn default() -> Self {
         Self {
@@ -297,26 +302,54 @@ impl Default for Look {
 /// same palette and flash white on a beat; motion never touches them. LEDs
 /// without a band — underglow and the top bands the half has no keys for — stay
 /// black.
+#[cfg(test)]
 pub fn compose(dynamics: &Dynamics, count: usize, look: &Look, motion: &MotionState) -> Vec<Rgb> {
+    let left = layout::band_cells_for(&look.layout, Half::Left);
+    let right = layout::band_cells_for(&look.layout, Half::Right);
+    compose_bands(dynamics, count, look.palette, &left, &right, motion)
+}
+
+/// The look engine's render entry point: uses the cached band table from a
+/// resolved selection, so a fade frame does not recompute a layout permutation.
+pub(crate) fn compose_resolved(
+    dynamics: &Dynamics,
+    count: usize,
+    look: &ResolvedLook,
+    motion: &MotionState,
+) -> Vec<Rgb> {
+    compose_bands(
+        dynamics,
+        count,
+        look.palette(),
+        look.bands(Half::Left),
+        look.bands(Half::Right),
+        motion,
+    )
+}
+
+fn compose_bands(
+    dynamics: &Dynamics,
+    count: usize,
+    palette: Palette,
+    left: &[(Cell, u8)],
+    right: &[(Cell, u8)],
+    motion: &MotionState,
+) -> Vec<Rgb> {
     let mut colours = vec![Rgb::BLACK; count];
     let config = dynamics.config;
-    for (half, preferred) in [(Half::Left, 0), (Half::Right, 1)] {
+    for (half, preferred, bands) in [(Half::Left, 0, left), (Half::Right, 1, right)] {
         // A mono capture feeds both halves; a stereo one feeds its own side.
         let channel = if dynamics.channels() == 1 {
             0
         } else {
             preferred
         };
-        for (band, (cell, led)) in layout::band_cells_for(&look.layout, half)
-            .iter()
-            .enumerate()
-        {
+        for (band, (cell, led)) in bands.iter().enumerate() {
             if band >= dynamics.bands() {
                 break;
             }
             if let Some(colour) = colours.get_mut(*led as usize) {
-                let sampled =
-                    palette::sample(look.palette, dynamics.level(channel, band), config.floor);
+                let sampled = palette::sample(palette, dynamics.level(channel, band), config.floor);
                 *colour = motion.modulate(sampled, *cell, half, dynamics);
             }
         }
@@ -327,7 +360,7 @@ pub fn compose(dynamics: &Dynamics, count: usize, look: &Look, motion: &MotionSt
         let thumb_colour = if config.beat_flash && dynamics.is_flashing(channel) {
             Rgb::new(255, 255, 255)
         } else if config.thumb_glow {
-            palette::sample(look.palette, dynamics.thumb_level(channel), config.floor)
+            palette::sample(palette, dynamics.thumb_level(channel), config.floor)
         } else {
             Rgb::BLACK
         };
