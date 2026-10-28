@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::layout::{self, Half, Layout};
 use crate::level;
+use crate::motion::MotionState;
 use crate::palette::{self, Palette};
 use crate::spectrum::Spectrum;
 use crate::theme::Rgb;
@@ -255,9 +256,10 @@ pub const FLOOR: f32 = 0.02;
 
 /// A fixed look: which layout places the bands and which palette colours them.
 ///
-/// The default is the v0.1 look, `snake` + `ember`. Motion joins this selection
-/// in ticket 02; keeping the selection explicit here means `compose` no longer
-/// hard-codes either axis.
+/// The default is the v0.1 look, `snake` + `ember`. Motion is deliberately not
+/// stored here: it carries a clock and event state, so `compose` takes an
+/// explicit `&MotionState` alongside the look. That is what lets a crossfade
+/// render two selections in one frame without advancing events twice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Look {
     pub layout: Layout,
@@ -274,11 +276,12 @@ impl Default for Look {
 }
 
 /// Paints the dynamics onto the grid: band *n* of a half lights that half's
-/// *n*-th LED in the selected layout, coloured by the selected palette. The thumb
-/// clusters carry their channel's level in the same palette and flash white on a
-/// beat. LEDs without a band — underglow and the top bands the half has no keys
-/// for — stay black.
-pub fn compose(dynamics: &Dynamics, count: usize, look: &Look) -> Vec<Rgb> {
+/// *n*-th LED in the selected layout, coloured by the selected palette and then
+/// modulated by `motion`. The thumb clusters carry their channel's level in the
+/// same palette and flash white on a beat; motion never touches them. LEDs
+/// without a band — underglow and the top bands the half has no keys for — stay
+/// black.
+pub fn compose(dynamics: &Dynamics, count: usize, look: &Look, motion: &MotionState) -> Vec<Rgb> {
     let mut colours = vec![Rgb::BLACK; count];
     let config = dynamics.config;
     for (half, preferred) in [(Half::Left, 0), (Half::Right, 1)] {
@@ -288,13 +291,17 @@ pub fn compose(dynamics: &Dynamics, count: usize, look: &Look) -> Vec<Rgb> {
         } else {
             preferred
         };
-        for (band, led) in layout::band_leds_for(&look.layout, half).iter().enumerate() {
+        for (band, (cell, led)) in layout::band_cells_for(&look.layout, half)
+            .iter()
+            .enumerate()
+        {
             if band >= dynamics.bands() {
                 break;
             }
             if let Some(colour) = colours.get_mut(*led as usize) {
-                *colour =
+                let sampled =
                     palette::sample(look.palette, dynamics.level(channel, band), config.floor);
+                *colour = motion.modulate(sampled, *cell, preferred, channel, dynamics);
             }
         }
 
@@ -556,6 +563,10 @@ mod tests {
         let look = Look::default();
         assert_eq!(look.layout, Layout::Snake);
         assert_eq!(look.palette, Palette::Ember);
+        let motion = MotionState::default().settings();
+        assert_eq!(motion.motion, crate::motion::Motion::None);
+        assert_eq!(motion.intensity, 1.0);
+        assert_eq!(motion.speed, 1.0);
     }
 
     #[test]
@@ -570,7 +581,7 @@ mod tests {
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
         dynamics.update(&spectrum_with(&bands), 1.0 / 30.0);
 
-        let snake = compose(&dynamics, 132, &Look::default());
+        let snake = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         let columns = compose(
             &dynamics,
             132,
@@ -578,6 +589,7 @@ mod tests {
                 layout: Layout::Columns,
                 palette: Palette::Ember,
             },
+            &MotionState::default(),
         );
         let ice = compose(
             &dynamics,
@@ -586,6 +598,7 @@ mod tests {
                 layout: Layout::Snake,
                 palette: Palette::Ice,
             },
+            &MotionState::default(),
         );
         assert_ne!(columns, snake, "changing the layout must move the bands");
         assert_ne!(ice, snake, "changing the palette must change the colours");
@@ -610,7 +623,7 @@ mod tests {
         spectrum.set_bands(1, &[1.0; BAND_COUNT]);
         dynamics.update(&spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         let expected: Vec<u8> = [Half::Left, Half::Right]
             .into_iter()
             .flat_map(|half| {
@@ -669,7 +682,7 @@ mod tests {
             "the band is mid-fade, got {level}"
         );
 
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         for led in 0..132u8 {
             assert_eq!(
                 colours[led as usize],
@@ -694,7 +707,7 @@ mod tests {
         spectrum.set_bands(1, &[1.0; BAND_COUNT]);
         dynamics.update(&spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         for half in [Half::Left, Half::Right] {
             for led in layout::thumb_leds(half) {
                 assert_eq!(
@@ -721,7 +734,7 @@ mod tests {
         bands[..BASS_BANDS].fill(0.8);
         dynamics.update(&spectrum_with(&bands), 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         for led in layout::thumb_leds(Half::Left) {
             assert_ne!(
                 colours[*led as usize],
@@ -818,7 +831,7 @@ mod tests {
         for _ in 0..4 {
             dynamics.update(&spectrum, 1.0 / 30.0);
         }
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         let left_thumb = layout::thumb_leds(Half::Left)[0];
         let right_thumb = layout::thumb_leds(Half::Right)[0];
         assert_ne!(
@@ -855,6 +868,7 @@ mod tests {
                 layout: Layout::Snake,
                 palette: Palette::Ice,
             },
+            &MotionState::default(),
         );
         for (half, channel) in [(Half::Left, 0), (Half::Right, 1)] {
             let expected =
@@ -896,6 +910,7 @@ mod tests {
                 layout: Layout::Snake,
                 palette: Palette::Ice,
             },
+            &MotionState::default(),
         );
         for half in [Half::Left, Half::Right] {
             for led in layout::thumb_leds(half) {
@@ -918,7 +933,7 @@ mod tests {
         dynamics.update(&hit, 1.0 / 30.0);
         assert!(dynamics.is_flashing(0));
 
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         // The band LED for band 0 must be the ramp of the level, not white.
         let band_led = layout::band_leds(Half::Left)[0];
         assert_ne!(
@@ -949,7 +964,7 @@ mod tests {
             !dynamics.is_flashing(0),
             "the gate must stop a floor from flashing"
         );
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         for half in [Half::Left, Half::Right] {
             for led in layout::thumb_leds(half) {
                 assert_eq!(
@@ -971,7 +986,7 @@ mod tests {
         spectrum.set_bands(1, &[0.0; BAND_COUNT]);
         dynamics.update(&spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         let left_led = layout::band_leds(Half::Left)[0];
         let right_led = layout::band_leds(Half::Right)[0];
         assert_ne!(colours[left_led as usize], Rgb::BLACK);
@@ -982,7 +997,7 @@ mod tests {
     fn a_mono_capture_feeds_both_halves() {
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
         dynamics.update(&spectral_flat(BAND_COUNT, 0.5), 1.0 / 30.0);
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         for half in [Half::Left, Half::Right] {
             let led = layout::band_leds(half)[0];
             assert_ne!(colours[led as usize], Rgb::BLACK);
@@ -993,7 +1008,7 @@ mod tests {
     fn a_frame_smaller_than_the_grid_does_not_panic() {
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
         dynamics.update(&spectral_flat(BAND_COUNT, 1.0), 1.0 / 30.0);
-        let colours = compose(&dynamics, 10, &Look::default());
+        let colours = compose(&dynamics, 10, &Look::default(), &MotionState::default());
         assert_eq!(colours.len(), 10);
     }
 
@@ -1083,7 +1098,7 @@ mod tests {
         let spectrum = analyzer.spectrum().expect("a full window is ready");
         dynamics.update(spectrum, 1.0 / 30.0);
 
-        let colours = compose(&dynamics, 132, &Look::default());
+        let colours = compose(&dynamics, 132, &Look::default(), &MotionState::default());
         assert!(
             colours.iter().any(|colour| *colour != Rgb::BLACK),
             "a 1 kHz tone must light the board"

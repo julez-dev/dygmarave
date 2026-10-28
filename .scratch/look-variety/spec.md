@@ -175,13 +175,18 @@ Startup logging: `seed=…` once, then one line per switch:
 
 - **`src/look.rs`** (new) — axis enums and name parsing, pools, shuffle bags,
   jittered deadlines, fade state, seed/RNG (`fastrand`).
+- **`src/motion.rs`** (new) — `Motion` name layer and `MotionState`: the
+  continuous clock, fixed sparkle/ripple/rain event buffers, `advance` for state,
+  and read-only matrix modulation. `Look`/`MotionState` are the explicit selection
+  and state passed to `compose`.
 - **`src/palette.rs`** (new) — named ramp stop tables and interpolation; `Rgb::lerp`.
 - **`src/layout.rs`** — `LayoutKind` (names, `ALL`, `from_name`, `resolve`) plus the
   resolved `Layout` and `band_leds_for(&Layout, Half)`; keep the existing
   `band_leds` as the `snake` path or replace its call sites. Geometry tests for
   permutation and mirroring.
-- **`src/render.rs`** — `compose` takes a selection (layout, palette, motion) and a
-  clock; motion functions; blur/glint helpers. `Dynamics`, `Pacer` unchanged.
+- **`src/render.rs`** — `compose` takes the `Look` selection (layout, palette) plus
+  a read-only `&MotionState`; thumb painting and band placement live here.
+  `Dynamics`, `Pacer` unchanged.
 - **`src/config.rs`** — `[look]` struct, defaults, validation, mapping to the
   engine's settings type.
 - **`src/args.rs`** — new flags, probe aliases, help text.

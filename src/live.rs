@@ -25,6 +25,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crate::audio::Block;
+use crate::motion::MotionState;
 use crate::render::{self, Dynamics, DynamicsConfig, Pacer};
 use crate::spectrum::{Analyzer, BandPlan, Spectrum};
 use crate::theme::Frame;
@@ -201,6 +202,10 @@ impl RateControl {
 pub struct Live {
     analyzer: Analyzer,
     dynamics: Dynamics,
+    /// The layout and palette selection currently rendered.
+    look: render::Look,
+    /// The motion selection, clock and event state currently rendered.
+    motion: MotionState,
     pacer: Pacer,
     /// Adaptive frame-rate control. Only the rate moves; spectral resolution is
     /// never reduced.
@@ -243,6 +248,8 @@ impl Live {
         Self {
             analyzer: Analyzer::new(plan, config.channels),
             dynamics: Dynamics::new(dynamics_config, config.channels, bands),
+            look: render::Look::default(),
+            motion: MotionState::default(),
             pacer: Pacer::new(period_of(config.fps), start),
             rate: RateControl::new(
                 RateConfig {
@@ -306,7 +313,9 @@ impl Live {
             self.dynamics.update(&self.silent, dt);
         }
 
-        let colours = render::compose(&self.dynamics, self.leds, &render::Look::default());
+        // Events advance once per frame here; compose is read-only over them.
+        self.motion.advance(now, &self.dynamics);
+        let colours = render::compose(&self.dynamics, self.leds, &self.look, &self.motion);
         Frame::from_colors(&colours)
     }
 
