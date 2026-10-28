@@ -32,6 +32,14 @@ _Avoid_: Hit, pulse, kick (these name the source, not the event)
 One physical side of the split keyboard.
 _Avoid_: Side, board, pane
 
+**Layer**:
+A named alternative keymap, active only while its layer key is held. The board has one keymap in effect at a time.
+_Avoid_: Profile, mode, mapping
+
+**Layer palette**:
+The colours the board shows while a layer is active, as configured in Bazecor. Static, and painted only at the moment the layer activates.
+_Avoid_: Theme (that is the baseline), colourway, scheme
+
 **Matrix**:
 The alphanumeric key area of a half, excluding the thumb clusters. The matrix is where the spectrum is drawn.
 _Avoid_: Grid, main area, block
@@ -91,6 +99,10 @@ _Avoid_: Falloff, release, smoothing
 **AGC**:
 Automatic gain control: each band is scaled against its own recent maximum, so quietly mastered music still fills the board.
 _Avoid_: Normalization, auto-gain, limiting
+
+**Learn pass**:
+A one-time recording, driven by the user, in which the daemon captures each layer's palette so it can replay it later.
+_Avoid_: Calibration, training, setup wizard
 
 **Gate**:
 The silence threshold below which the board goes black rather than showing amplified noise.
