@@ -60,10 +60,14 @@ inner column, which is why the v0.1 row snake was chosen over a column snake.)
 | `rings` | Sort by squared distance from the inner home-row edge `d² = 4·depth² + (2·row − 3)²`, ties by row then depth. |
 | `diagonal` | Sort by `row + depth`, ties by row. |
 | `spiral` | Clockwise inward spiral over the 4×7 bounding rectangle starting at the inner-top cell; holes are skipped; unreached cells are appended row/depth order. Exact path written and tested in ticket 01. |
-| `scatter` | Seeded Fisher–Yates over the present keys, regenerated on each draw of `scatter`, frozen for that turn. |
+| `scatter` | Seeded Fisher–Yates shuffle of the full 4×7 normalised rectangle, regenerated on each draw of `scatter`, frozen for that turn and filtered to each half's present keys. |
 
 All layouts are mirrored: the right half uses the same normalised ordering, mapped
-to physical columns 9–15.
+to physical columns 9–15. `scatter` keeps that property by shuffling the full
+rectangle before either half filters its holes. Both halves therefore consume the
+same normalised order, and the restriction of a uniform full-rectangle permutation
+to a half's present cells is a uniform permutation of those cells — so each half
+is still fairly scattered despite the halves having different holes.
 
 ### Palettes
 

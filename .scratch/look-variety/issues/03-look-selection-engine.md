@@ -47,6 +47,9 @@ it owns the fade state so `render::compose` stays pure.
 - Add `fastrand` and use `Rng::with_seed`; no other RNG source.
 - The engine should take an explicit `now: Instant` so tests do not sleep. The
   live loop already passes `now` into `Live::step`.
+- Store a `LayoutKind` in the settings and call `LayoutKind::resolve(&mut rng)`
+  once when a selection is drawn. Cache the resolved band table for the turn;
+  never redraw scatter or recompute the permutation per frame.
 - Suggested shape: `LookState::new(settings, seed, now) -> LookState`,
   `LookState::tick(now) -> Option<Switch>`, `LookState::selection() -> Selection`,
   `LookState::fade_alpha(now) -> f32`,

@@ -152,11 +152,23 @@ impl fmt::Display for Palette {
 }
 
 /// Why a palette name was not recognised.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown palette {name:?}; expected one of ember, ice, magma, neon, mono, spectrum, solar, forest")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownPalette {
     pub name: String,
 }
+
+impl fmt::Display for UnknownPalette {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let expected = Palette::ALL.map(|palette| palette.name()).join(", ");
+        write!(
+            f,
+            "unknown palette {:?}; expected one of {expected}",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for UnknownPalette {}
 
 impl FromStr for Palette {
     type Err = UnknownPalette;
@@ -207,8 +219,7 @@ pub fn sample(palette: Palette, level: f32, floor: f32) -> Rgb {
         1.0
     };
 
-    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Rgb::new(mix(from.r, to.r), mix(from.g, to.g), mix(from.b, to.b))
+    from.lerp(to, t)
 }
 
 /// A stop position as an integer number of thousandths.
@@ -280,6 +291,13 @@ mod tests {
                     "{palette}: positions {} and {} are not ascending",
                     pair[0].0,
                     pair[1].0
+                );
+            }
+            for (position, _) in stops {
+                let snapped = whole_thousandths(*position) as f32 / 1000.0;
+                assert_eq!(
+                    snapped, *position,
+                    "{palette} stop {position} is not a whole thousandth; interpolation spans assume they are"
                 );
             }
         }

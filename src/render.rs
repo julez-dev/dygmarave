@@ -834,6 +834,82 @@ mod tests {
     }
 
     #[test]
+    fn ice_palette_colours_the_thumb_level_glow() {
+        let config = DynamicsConfig {
+            beat_flash: false,
+            beat_threshold: 1_000.0,
+            ..DynamicsConfig::default()
+        };
+        let mut dynamics = Dynamics::new(config, 2, BAND_COUNT);
+        let mut bands_left = vec![0.0; BAND_COUNT];
+        bands_left[..BASS_BANDS].fill(0.8);
+        let mut spectrum = Spectrum::new(2, BAND_COUNT);
+        spectrum.set_bands(0, &bands_left);
+        spectrum.set_bands(1, &[0.0; BAND_COUNT]);
+        dynamics.update(&spectrum, 1.0 / 30.0);
+
+        let colours = compose(
+            &dynamics,
+            132,
+            &Look {
+                layout: Layout::Snake,
+                palette: Palette::Ice,
+            },
+        );
+        for (half, channel) in [(Half::Left, 0), (Half::Right, 1)] {
+            let expected =
+                palette::sample(Palette::Ice, dynamics.thumb_level(channel), config.floor);
+            for led in layout::thumb_leds(half) {
+                assert_eq!(
+                    colours[*led as usize],
+                    expected,
+                    "{} thumb {led} must use the active Ice palette",
+                    half.name()
+                );
+            }
+        }
+        assert_ne!(
+            colours[layout::thumb_leds(Half::Left)[0] as usize],
+            Rgb::BLACK,
+            "the playing channel's thumb should be lit"
+        );
+        assert_eq!(
+            colours[layout::thumb_leds(Half::Right)[0] as usize],
+            Rgb::BLACK,
+            "the silent channel's thumb should be dark"
+        );
+    }
+
+    #[test]
+    fn ice_palette_does_not_change_the_white_beat_flash() {
+        let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
+        dynamics.update(&spectral_flat(BAND_COUNT, 0.0), 1.0 / 30.0);
+        let mut bands = vec![0.0; BAND_COUNT];
+        bands[..BASS_BANDS].fill(0.8);
+        dynamics.update(&spectrum_with(&bands), 1.0 / 30.0);
+        assert!(dynamics.is_flashing(0));
+
+        let colours = compose(
+            &dynamics,
+            132,
+            &Look {
+                layout: Layout::Snake,
+                palette: Palette::Ice,
+            },
+        );
+        for half in [Half::Left, Half::Right] {
+            for led in layout::thumb_leds(half) {
+                assert_eq!(
+                    colours[*led as usize],
+                    Rgb::new(255, 255, 255),
+                    "{} thumb {led} must flash white regardless of palette",
+                    half.name()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn matrix_bands_are_unaffected_by_the_beat_flash() {
         let mut dynamics = Dynamics::new(DynamicsConfig::default(), 1, BAND_COUNT);
         let mut bands = vec![0.0; BAND_COUNT];

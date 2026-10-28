@@ -21,6 +21,21 @@ impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+
+    /// Blends toward `other` by `t`, rounding each channel to the nearest byte.
+    ///
+    /// `t` is clamped, so out-of-range callers get an endpoint rather than a
+    /// wrapped colour. This is the same blend and rounding the colour ramp uses,
+    /// and the crossfade in ticket 03 will use it too.
+    pub fn lerp(self, other: Rgb, t: f32) -> Rgb {
+        let t = t.clamp(0.0, 1.0);
+        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        Rgb::new(
+            mix(self.r, other.r),
+            mix(self.g, other.g),
+            mix(self.b, other.b),
+        )
+    }
 }
 
 impl Rgb {
@@ -198,6 +213,18 @@ mod tests {
         let frame = Frame::uniform(2, Rgb::new(1, 2, 3));
         assert_eq!(frame.body(), "led.theme 1 2 3 1 2 3");
         assert_eq!(frame.byte_len(), frame.body().len() + 1);
+    }
+
+    #[test]
+    fn lerp_blends_and_rounds_each_channel() {
+        let black = Rgb::new(0, 0, 0);
+        let red = Rgb::new(255, 0, 0);
+        let white = Rgb::new(255, 255, 255);
+        assert_eq!(black.lerp(red, 0.0), black);
+        assert_eq!(black.lerp(red, 1.0), red);
+        assert_eq!(red.lerp(white, 0.5), Rgb::new(255, 128, 128));
+        assert_eq!(black.lerp(red, -1.0), black, "t is clamped");
+        assert_eq!(black.lerp(red, 2.0), red, "t is clamped");
     }
 
     #[test]

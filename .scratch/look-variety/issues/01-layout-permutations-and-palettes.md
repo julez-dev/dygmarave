@@ -11,19 +11,21 @@ configured in code to show any layout with any palette, but still uses
 
 ## Acceptance criteria
 
-- [x] `layout::Layout` names all eight layouts: `snake`, `vertical-snake`, `rows`,
-      `columns`, `rings`, `diagonal`, `spiral`, `scatter`. Names parse from and
-      render to the config spelling.
+- [x] `layout::LayoutKind` names all eight layouts: `snake`, `vertical-snake`,
+      `rows`, `columns`, `rings`, `diagonal`, `spiral`, `scatter`. Names parse from
+      and render to the config spelling; resolving a kind is the only way to get a
+      concrete `layout::Layout`.
 - [x] `layout::band_leds_for(Layout, Half)` returns one LED per band for the
       active layout. `Layout::Snake` reproduces the current `band_leds` output
       exactly (byte-identical LED vectors on both halves).
 - [x] The other geometric layouts are deterministic, mirrored across halves, and
       defined exactly as the spec describes (`vertical-snake`, `rows`, `columns`,
       `rings`, `diagonal`, `spiral`).
-- [x] `scatter` builds a Fisher–Yates permutation of the half's present keys from
-      a caller-supplied `fastrand::Rng`; the active permutation is frozen for the
-      turn rather than regenerated per frame. The caller-facing shape supports
-      ticket 03 drawing a fresh one per selection.
+- [x] `scatter` builds a Fisher–Yates permutation of the full 4×7 normalised
+      rectangle from a caller-supplied `fastrand::Rng`, then each half filters its
+      own holes. The active permutation is frozen for the turn rather than
+      regenerated per frame, and `LayoutKind::resolve` supports ticket 03 drawing a
+      fresh one per selection.
 - [x] Every layout is a permutation: no duplicated band, no dropped present key,
       no band on a hole, no band on a thumb or underglow LED. Tests cover 26 keys
       left, 27 right, and the mirrored counterpart of every left key except the
@@ -60,13 +62,15 @@ configured in code to show any layout with any palette, but still uses
 
 Implemented on branch `look-variety`; ticket 02 is untouched.
 
-- **Layout API.** `layout::Layout` is a data-carrying enum because `scatter` must
-  hold its frozen permutation: `Layout::Scatter(Scatter)`; draw one with
-  `Layout::scatter(&mut fastrand::Rng)` and reuse that value for the turn.
-  `Layout::from_name("scatter")` returns the row-major permutation so name
-  round-trips work; ticket 03 must use `Layout::scatter` when the bag draws
-  scatter. `band_leds_for` takes `&Layout` so a frozen scatter can be rendered on
-  both halves without cloning it into every frame.
+- **Layout API (review fix).** Names live in `layout::LayoutKind`, which is
+  `Copy` and has `ALL`, `NAMES`, `name`, `from_name`, `Display` and `FromStr`.
+  `LayoutKind::resolve(&mut fastrand::Rng)` is the only way to obtain a concrete
+  `layout::Layout`. Resolving `Scatter` always calls `Scatter::draw`; there is no
+  identity/row-major scatter to fall into by accident. `Layout` is a
+  data-carrying enum because scatter holds its frozen permutation, and
+  `band_leds_for` takes `&Layout` so both halves can render that frozen value
+  without cloning it into every frame. Ticket 03 should resolve once per
+  selection and cache the resulting band table.
 - **Snake equivalence.** `band_leds` is now a wrapper over
   `band_leds_for(&Layout::Snake, half)`. Its byte-identical output is pinned by a
   hard-coded test on both halves, separate from the geometric permutation tests.
@@ -89,5 +93,5 @@ Implemented on branch `look-variety`; ticket 02 is untouched.
 - **Skipped:** static layout probes. They would add CLI scope, which the ticket
   made optional; ticket 04 can add a probe when it owns the `--probe-*` surface.
 
-Validation run locally: `cargo test` (195 tests), `cargo clippy --all-targets --
+Validation run locally: `cargo test` (199 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.

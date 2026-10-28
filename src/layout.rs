@@ -255,18 +255,102 @@ impl Scatter {
         }
         Self { cells }
     }
+}
 
-    /// The row-major permutation, used only when a name is parsed without an RNG.
-    fn identity() -> Self {
-        Self { cells: ALL_CELLS }
+/// The name of a layout, before it is resolved into a concrete band order.
+///
+/// A name cannot produce a [`Layout`] on its own: `scatter` needs the run RNG.
+/// Parsing therefore stops at the kind, and [`LayoutKind::resolve`] is the only
+/// door to a resolved layout. That makes an unresolved or row-major scatter
+/// unrepresentable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayoutKind {
+    #[default]
+    Snake,
+    VerticalSnake,
+    Rows,
+    Columns,
+    Rings,
+    Diagonal,
+    Spiral,
+    Scatter,
+}
+
+impl LayoutKind {
+    /// Every layout kind, in the order the spec lists them.
+    pub const ALL: [LayoutKind; 8] = [
+        LayoutKind::Snake,
+        LayoutKind::VerticalSnake,
+        LayoutKind::Rows,
+        LayoutKind::Columns,
+        LayoutKind::Rings,
+        LayoutKind::Diagonal,
+        LayoutKind::Spiral,
+        LayoutKind::Scatter,
+    ];
+
+    /// The config spelling of every layout kind.
+    pub const NAMES: [&'static str; 8] = [
+        "snake",
+        "vertical-snake",
+        "rows",
+        "columns",
+        "rings",
+        "diagonal",
+        "spiral",
+        "scatter",
+    ];
+
+    /// The config spelling.
+    pub const fn name(self) -> &'static str {
+        match self {
+            LayoutKind::Snake => "snake",
+            LayoutKind::VerticalSnake => "vertical-snake",
+            LayoutKind::Rows => "rows",
+            LayoutKind::Columns => "columns",
+            LayoutKind::Rings => "rings",
+            LayoutKind::Diagonal => "diagonal",
+            LayoutKind::Spiral => "spiral",
+            LayoutKind::Scatter => "scatter",
+        }
+    }
+
+    /// Parses a config spelling, case-sensitively.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// Resolves this kind into a concrete band order.
+    ///
+    /// `scatter` always draws a fresh Fisher–Yates permutation from `rng`; the
+    /// other kinds are deterministic. Call this once per selection and reuse the
+    /// resolved [`Layout`] for every frame until the next selection.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn resolve(self, rng: &mut fastrand::Rng) -> Layout {
+        match self {
+            LayoutKind::Snake => Layout::Snake,
+            LayoutKind::VerticalSnake => Layout::VerticalSnake,
+            LayoutKind::Rows => Layout::Rows,
+            LayoutKind::Columns => Layout::Columns,
+            LayoutKind::Rings => Layout::Rings,
+            LayoutKind::Diagonal => Layout::Diagonal,
+            LayoutKind::Spiral => Layout::Spiral,
+            LayoutKind::Scatter => Layout::Scatter(Scatter::draw(rng)),
+        }
     }
 }
 
-/// How a half's keys are ordered into bands.
+impl fmt::Display for LayoutKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// How a half's keys are ordered into bands, already resolved.
 ///
-/// `scatter` carries its frozen permutation: draw one with [`Layout::scatter`]
-/// when a new scatter selection is made, then pass the same value to every frame
-/// until the next selection.
+/// `scatter` carries its frozen permutation. There is deliberately no way to
+/// construct a scatter without drawing one: [`LayoutKind::resolve`] is the only
+/// public constructor, and [`Scatter::draw`] is the only way it makes one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
     #[default]
@@ -280,75 +364,26 @@ pub enum Layout {
     Scatter(Scatter),
 }
 
-impl Layout {
-    /// Every layout, in the order the spec lists them.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub const NAMES: [&'static str; 8] = [
-        "snake",
-        "vertical-snake",
-        "rows",
-        "columns",
-        "rings",
-        "diagonal",
-        "spiral",
-        "scatter",
-    ];
-
-    /// The config spelling.
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Layout::Snake => "snake",
-            Layout::VerticalSnake => "vertical-snake",
-            Layout::Rows => "rows",
-            Layout::Columns => "columns",
-            Layout::Rings => "rings",
-            Layout::Diagonal => "diagonal",
-            Layout::Spiral => "spiral",
-            Layout::Scatter(_) => "scatter",
-        }
-    }
-
-    /// Parses a config spelling, case-sensitively.
-    ///
-    /// `"scatter"` comes back with the row-major permutation; callers that want a
-    /// fresh scatter draw it with [`Layout::scatter`] and the run RNG.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "snake" => Some(Layout::Snake),
-            "vertical-snake" => Some(Layout::VerticalSnake),
-            "rows" => Some(Layout::Rows),
-            "columns" => Some(Layout::Columns),
-            "rings" => Some(Layout::Rings),
-            "diagonal" => Some(Layout::Diagonal),
-            "spiral" => Some(Layout::Spiral),
-            "scatter" => Some(Layout::Scatter(Scatter::identity())),
-            _ => None,
-        }
-    }
-
-    /// Draws a fresh frozen scatter permutation from the run RNG.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn scatter(rng: &mut fastrand::Rng) -> Self {
-        Layout::Scatter(Scatter::draw(rng))
-    }
-}
-
-impl fmt::Display for Layout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
 /// Why a layout name was not recognised.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "unknown layout {name:?}; expected one of snake, vertical-snake, rows, columns, rings, diagonal, spiral, scatter"
-)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownLayout {
     pub name: String,
 }
 
-impl FromStr for Layout {
+impl fmt::Display for UnknownLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown layout {:?}; expected one of {}",
+            self.name,
+            LayoutKind::NAMES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownLayout {}
+
+impl FromStr for LayoutKind {
     type Err = UnknownLayout;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
@@ -1015,18 +1050,12 @@ mod tests {
         }
     }
 
-    fn all_layouts() -> Vec<Layout> {
+    fn all_layouts() -> Vec<(LayoutKind, Layout)> {
         let mut rng = fastrand::Rng::with_seed(0x5ca7_7e12);
-        vec![
-            Layout::Snake,
-            Layout::VerticalSnake,
-            Layout::Rows,
-            Layout::Columns,
-            Layout::Rings,
-            Layout::Diagonal,
-            Layout::Spiral,
-            Layout::scatter(&mut rng),
-        ]
+        LayoutKind::ALL
+            .into_iter()
+            .map(|kind| (kind, kind.resolve(&mut rng)))
+            .collect()
     }
 
     /// The LEDs a half's four letter rows contain, in row-major order.
@@ -1052,21 +1081,22 @@ mod tests {
     }
 
     #[test]
-    fn every_layout_name_round_trips() {
-        assert_eq!(Layout::NAMES.len(), 8);
-        for name in Layout::NAMES {
-            let layout: Layout = name.parse().expect("the name must parse");
-            assert_eq!(layout.name(), name);
-            assert_eq!(layout.to_string(), name);
-            assert_eq!(Layout::from_name(name).unwrap().name(), name);
+    fn every_layout_kind_name_round_trips() {
+        assert_eq!(LayoutKind::ALL.len(), 8);
+        assert_eq!(LayoutKind::NAMES.len(), 8);
+        for name in LayoutKind::NAMES {
+            let kind: LayoutKind = name.parse().expect("the name must parse");
+            assert_eq!(kind.name(), name);
+            assert_eq!(kind.to_string(), name);
+            assert_eq!(LayoutKind::from_name(name), Some(kind));
         }
         assert_eq!(
-            "nope".parse::<Layout>(),
+            "nope".parse::<LayoutKind>(),
             Err(UnknownLayout {
                 name: "nope".to_string()
             })
         );
-        assert_eq!(Layout::default(), Layout::Snake);
+        assert_eq!(LayoutKind::default(), LayoutKind::Snake);
     }
 
     #[test]
@@ -1091,7 +1121,7 @@ mod tests {
 
     #[test]
     fn every_layout_is_a_permutation_of_the_present_letter_keys() {
-        for layout in all_layouts() {
+        for (kind, layout) in all_layouts() {
             for half in [Half::Left, Half::Right] {
                 let leds = band_leds_for(&layout, half);
                 let expected = letter_keys(half);
@@ -1099,14 +1129,14 @@ mod tests {
                     leds.len(),
                     expected.len(),
                     "{} dropped a {} key",
-                    layout.name(),
+                    kind.name(),
                     half.name()
                 );
                 assert_eq!(
                     leds.len(),
                     if half == Half::Left { 26 } else { 27 },
                     "{} has the wrong capacity on the {} half",
-                    layout.name(),
+                    kind.name(),
                     half.name()
                 );
                 let mut unique = leds.clone();
@@ -1116,24 +1146,24 @@ mod tests {
                     unique.len(),
                     leds.len(),
                     "{} repeats a key on the {} half",
-                    layout.name(),
+                    kind.name(),
                     half.name()
                 );
                 for led in &leds {
                     assert!(
                         expected.contains(led),
                         "{} put a band on non-letter LED {led}",
-                        layout.name()
+                        kind.name()
                     );
                     assert!(
                         !thumb_leds(half).contains(led),
                         "{} put a band on thumb LED {led}",
-                        layout.name()
+                        kind.name()
                     );
                     assert!(
                         (*led as usize) < 69,
                         "{} put a band on underglow LED {led}",
-                        layout.name()
+                        kind.name()
                     );
                 }
             }
@@ -1142,7 +1172,7 @@ mod tests {
 
     #[test]
     fn every_layout_orders_the_halves_as_mirror_images() {
-        for layout in all_layouts() {
+        for (kind, layout) in all_layouts() {
             let mut left = sequence(&layout, Half::Left);
             let mut right = sequence(&layout, Half::Right);
             // The board's single asymmetric pair: left (3, inner) has no right
@@ -1154,80 +1184,191 @@ mod tests {
                 left,
                 right,
                 "{} does not use the same normalised order on both halves",
-                layout.name()
+                kind.name()
             );
         }
     }
 
     #[test]
-    fn rows_and_columns_are_the_documented_orders() {
-        assert_eq!(cells_in_order(&Layout::Rows), ALL_CELLS.to_vec());
-        let mut columns = Vec::new();
-        for depth in 0..DEPTHS {
-            for row in LETTER_ROWS {
-                columns.push(Cell::new(row, depth));
-            }
-        }
-        assert_eq!(cells_in_order(&Layout::Columns), columns);
+    fn rows_and_columns_match_literal_led_sequences() {
+        let rows_left = vec![
+            6, 5, 4, 3, 2, 1, 0, // row 0: inner to outer
+            12, 11, 10, 9, 8, 7, // row 1: inner to outer, inner hole skipped
+            18, 17, 16, 15, 14, 13, // row 2: inner to outer, inner hole skipped
+            25, 24, 23, 22, 21, 20, 19, // row 3: inner to outer
+        ];
+        let rows_right = vec![
+            39, 38, 37, 36, 35, 34, 33, // row 0: inner to outer
+            47, 46, 45, 44, 43, 42, 41, // row 1: inner to outer
+            54, 53, 52, 51, 50, 49, 48, // row 2: inner to outer
+            60, 59, 58, 57, 56, 55, // row 3: inner to outer, inner hole skipped
+        ];
+        let columns_left = vec![
+            6, 25, // depth 0
+            5, 12, 18, 24, // depth 1
+            4, 11, 17, 23, // depth 2
+            3, 10, 16, 22, // depth 3
+            2, 9, 15, 21, // depth 4
+            1, 8, 14, 20, // depth 5
+            0, 7, 13, 19, // depth 6
+        ];
+        let columns_right = vec![
+            39, 47, 54, // depth 0, bottom hole skipped
+            38, 46, 53, 60, // depth 1
+            37, 45, 52, 59, // depth 2
+            36, 44, 51, 58, // depth 3
+            35, 43, 50, 57, // depth 4
+            34, 42, 49, 56, // depth 5
+            33, 41, 48, 55, // depth 6
+        ];
+        assert_eq!(band_leds_for(&Layout::Rows, Half::Left), rows_left);
+        assert_eq!(band_leds_for(&Layout::Rows, Half::Right), rows_right);
+        assert_eq!(band_leds_for(&Layout::Columns, Half::Left), columns_left);
+        assert_eq!(band_leds_for(&Layout::Columns, Half::Right), columns_right);
     }
 
     #[test]
     fn vertical_snake_alternates_down_and_up_columns() {
-        let order = cells_in_order(&Layout::VerticalSnake);
-        assert_eq!(
-            &order[..4],
-            &[
-                Cell::new(0, 0),
-                Cell::new(1, 0),
-                Cell::new(2, 0),
-                Cell::new(3, 0)
-            ]
-        );
-        assert_eq!(
-            &order[4..8],
-            &[
-                Cell::new(3, 1),
-                Cell::new(2, 1),
-                Cell::new(1, 1),
-                Cell::new(0, 1)
-            ]
-        );
-        assert_eq!(order.len(), CELLS);
+        let expected = [
+            Cell::new(0, 0),
+            Cell::new(1, 0),
+            Cell::new(2, 0),
+            Cell::new(3, 0),
+            Cell::new(3, 1),
+            Cell::new(2, 1),
+            Cell::new(1, 1),
+            Cell::new(0, 1),
+            Cell::new(0, 2),
+            Cell::new(1, 2),
+            Cell::new(2, 2),
+            Cell::new(3, 2),
+            Cell::new(3, 3),
+            Cell::new(2, 3),
+            Cell::new(1, 3),
+            Cell::new(0, 3),
+            Cell::new(0, 4),
+            Cell::new(1, 4),
+            Cell::new(2, 4),
+            Cell::new(3, 4),
+            Cell::new(3, 5),
+            Cell::new(2, 5),
+            Cell::new(1, 5),
+            Cell::new(0, 5),
+            Cell::new(0, 6),
+            Cell::new(1, 6),
+            Cell::new(2, 6),
+            Cell::new(3, 6),
+        ];
+        assert_eq!(cells_in_order(&Layout::VerticalSnake), expected.to_vec());
     }
 
     #[test]
-    fn rings_and_diagonal_sort_by_their_documented_keys() {
-        let rings = cells_in_order(&Layout::Rings);
-        for pair in rings.windows(2) {
-            let first = (ring_key(pair[0]), pair[0].row, pair[0].depth);
-            let second = (ring_key(pair[1]), pair[1].row, pair[1].depth);
-            assert!(
-                first <= second,
-                "rings order reversed: {first:?} > {second:?}"
-            );
-        }
+    fn rings_and_diagonal_match_literal_orders() {
+        // A few literal keys pin the formula independently of the implementation.
+        assert_eq!(ring_key(Cell::new(1, 0)), 1);
+        assert_eq!(ring_key(Cell::new(2, 0)), 1);
+        assert_eq!(ring_key(Cell::new(0, 0)), 9);
+        assert_eq!(ring_key(Cell::new(0, 1)), 13);
+        assert_eq!(ring_key(Cell::new(3, 6)), 153);
 
-        let diagonal = cells_in_order(&Layout::Diagonal);
-        for pair in diagonal.windows(2) {
-            let first = (
-                pair[0].row as u16 + pair[0].depth as u16,
-                pair[0].row,
-                pair[0].depth,
-            );
-            let second = (
-                pair[1].row as u16 + pair[1].depth as u16,
-                pair[1].row,
-                pair[1].depth,
-            );
-            assert!(
-                first <= second,
-                "diagonal order reversed: {first:?} > {second:?}"
-            );
-        }
+        let rings = [
+            Cell::new(1, 0),
+            Cell::new(2, 0),
+            Cell::new(1, 1),
+            Cell::new(2, 1),
+            Cell::new(0, 0),
+            Cell::new(3, 0),
+            Cell::new(0, 1),
+            Cell::new(3, 1),
+            Cell::new(1, 2),
+            Cell::new(2, 2),
+            Cell::new(0, 2),
+            Cell::new(3, 2),
+            Cell::new(1, 3),
+            Cell::new(2, 3),
+            Cell::new(0, 3),
+            Cell::new(3, 3),
+            Cell::new(1, 4),
+            Cell::new(2, 4),
+            Cell::new(0, 4),
+            Cell::new(3, 4),
+            Cell::new(1, 5),
+            Cell::new(2, 5),
+            Cell::new(0, 5),
+            Cell::new(3, 5),
+            Cell::new(1, 6),
+            Cell::new(2, 6),
+            Cell::new(0, 6),
+            Cell::new(3, 6),
+        ];
+        assert_eq!(cells_in_order(&Layout::Rings), rings.to_vec());
+
+        let diagonal = [
+            Cell::new(0, 0),
+            Cell::new(0, 1),
+            Cell::new(1, 0),
+            Cell::new(0, 2),
+            Cell::new(1, 1),
+            Cell::new(2, 0),
+            Cell::new(0, 3),
+            Cell::new(1, 2),
+            Cell::new(2, 1),
+            Cell::new(3, 0),
+            Cell::new(0, 4),
+            Cell::new(1, 3),
+            Cell::new(2, 2),
+            Cell::new(3, 1),
+            Cell::new(0, 5),
+            Cell::new(1, 4),
+            Cell::new(2, 3),
+            Cell::new(3, 2),
+            Cell::new(0, 6),
+            Cell::new(1, 5),
+            Cell::new(2, 4),
+            Cell::new(3, 3),
+            Cell::new(1, 6),
+            Cell::new(2, 5),
+            Cell::new(3, 4),
+            Cell::new(2, 6),
+            Cell::new(3, 5),
+            Cell::new(3, 6),
+        ];
+        assert_eq!(cells_in_order(&Layout::Diagonal), diagonal.to_vec());
     }
 
     #[test]
     fn the_spiral_path_is_the_documented_clockwise_spiral() {
+        let expected = [
+            Cell::new(0, 0),
+            Cell::new(0, 1),
+            Cell::new(0, 2),
+            Cell::new(0, 3),
+            Cell::new(0, 4),
+            Cell::new(0, 5),
+            Cell::new(0, 6),
+            Cell::new(1, 6),
+            Cell::new(2, 6),
+            Cell::new(3, 6),
+            Cell::new(3, 5),
+            Cell::new(3, 4),
+            Cell::new(3, 3),
+            Cell::new(3, 2),
+            Cell::new(3, 1),
+            Cell::new(3, 0),
+            Cell::new(2, 0),
+            Cell::new(1, 0),
+            Cell::new(1, 1),
+            Cell::new(1, 2),
+            Cell::new(1, 3),
+            Cell::new(1, 4),
+            Cell::new(1, 5),
+            Cell::new(2, 5),
+            Cell::new(2, 4),
+            Cell::new(2, 3),
+            Cell::new(2, 2),
+            Cell::new(2, 1),
+        ];
+        assert_eq!(SPIRAL_CELLS, expected);
         assert_eq!(SPIRAL_CELLS.len(), CELLS);
         let mut seen = SPIRAL_CELLS.to_vec();
         seen.sort_by_key(|cell| (cell.row, cell.depth));
@@ -1239,30 +1380,15 @@ mod tests {
             let step = pair[0].row.abs_diff(pair[1].row) + pair[0].depth.abs_diff(pair[1].depth);
             assert_eq!(step, 1, "the spiral path must be contiguous");
         }
-        assert_eq!(
-            &SPIRAL_CELLS[..10],
-            &[
-                Cell::new(0, 0),
-                Cell::new(0, 1),
-                Cell::new(0, 2),
-                Cell::new(0, 3),
-                Cell::new(0, 4),
-                Cell::new(0, 5),
-                Cell::new(0, 6),
-                Cell::new(1, 6),
-                Cell::new(2, 6),
-                Cell::new(3, 6),
-            ]
-        );
     }
 
     #[test]
     fn scatter_is_seeded_and_frozen_for_the_turn() {
         let mut rng = fastrand::Rng::with_seed(1_234);
-        let first = Layout::scatter(&mut rng);
+        let first = LayoutKind::Scatter.resolve(&mut rng);
 
         let mut same_seed = fastrand::Rng::with_seed(1_234);
-        let repeated = Layout::scatter(&mut same_seed);
+        let repeated = LayoutKind::Scatter.resolve(&mut same_seed);
         assert_eq!(first, repeated, "the same seed must draw the same scatter");
         for half in [Half::Left, Half::Right] {
             assert_eq!(
@@ -1272,11 +1398,55 @@ mod tests {
             );
         }
 
+        let mut rows_rng = fastrand::Rng::with_seed(1_234);
+        let rows = LayoutKind::Rows.resolve(&mut rows_rng);
+        assert_ne!(first, rows, "a resolved scatter must not degrade into rows");
+
         let mut other_seed = fastrand::Rng::with_seed(4_321);
-        let different = Layout::scatter(&mut other_seed);
+        let different = LayoutKind::Scatter.resolve(&mut other_seed);
         assert_ne!(first, different, "different seeds must differ");
 
-        let next = Layout::scatter(&mut rng);
+        let next = LayoutKind::Scatter.resolve(&mut rng);
         assert_ne!(first, next, "each draw must advance the caller's RNG");
+    }
+
+    #[test]
+    fn a_seeded_scatter_has_a_pinned_permutation() {
+        // Pinned so a change to the shuffle order, the RNG call pattern, or the
+        // full-rectangle/filter split is visible. The value is the full 4x7
+        // permutation; each half filters its own holes when rendering.
+        let mut rng = fastrand::Rng::with_seed(1_234);
+        let scatter = LayoutKind::Scatter.resolve(&mut rng);
+        let expected = [
+            Cell::new(3, 4),
+            Cell::new(3, 0),
+            Cell::new(3, 1),
+            Cell::new(1, 6),
+            Cell::new(1, 0),
+            Cell::new(2, 6),
+            Cell::new(2, 4),
+            Cell::new(2, 0),
+            Cell::new(2, 3),
+            Cell::new(2, 5),
+            Cell::new(0, 5),
+            Cell::new(3, 6),
+            Cell::new(1, 5),
+            Cell::new(1, 1),
+            Cell::new(1, 4),
+            Cell::new(0, 0),
+            Cell::new(3, 3),
+            Cell::new(3, 5),
+            Cell::new(0, 2),
+            Cell::new(1, 3),
+            Cell::new(0, 1),
+            Cell::new(3, 2),
+            Cell::new(0, 6),
+            Cell::new(1, 2),
+            Cell::new(2, 1),
+            Cell::new(2, 2),
+            Cell::new(0, 4),
+            Cell::new(0, 3),
+        ];
+        assert_eq!(cells_in_order(&scatter), expected.to_vec());
     }
 }
