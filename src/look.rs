@@ -17,10 +17,11 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use crate::dynamics::Dynamics;
 use crate::layout::{self, Cell, Half, Layout, LayoutKind};
 use crate::motion::{Motion, MotionSettings, MotionState};
 use crate::palette::Palette;
-use crate::render::{self, Dynamics};
+use crate::render;
 use crate::theme::Rgb;
 
 /// Salt that separates the motion-event RNG stream from the selection stream.
@@ -497,8 +498,14 @@ impl LookState {
     /// screen snapshot if a fade is active.
     pub fn render(&mut self, now: Instant, dynamics: &Dynamics, count: usize) -> Vec<Rgb> {
         self.motion_state.advance(now, dynamics);
-        let mut frame =
-            render::compose_resolved(dynamics, count, &self.current, &self.motion_state);
+        let mut frame = render::compose_bands(
+            dynamics,
+            count,
+            self.current.palette(),
+            self.current.bands(Half::Left),
+            self.current.bands(Half::Right),
+            &self.motion_state,
+        );
 
         let alpha = self.fade_alpha(now);
         let fading = self
@@ -547,7 +554,7 @@ mod tests {
     fn dynamics_with_bands(values: &[f32]) -> Dynamics {
         let mut spectrum = Spectrum::new(1, values.len());
         spectrum.set_bands(0, values);
-        let mut dynamics = Dynamics::new(crate::render::DynamicsConfig::default(), 1, BAND_COUNT);
+        let mut dynamics = Dynamics::new(crate::dynamics::DynamicsConfig::default(), 1, BAND_COUNT);
         dynamics.update(&spectrum, 1.0 / 30.0);
         dynamics
     }
@@ -561,7 +568,14 @@ mod tests {
     }
 
     fn target_frame(look: &LookState, dynamics: &Dynamics) -> Vec<Rgb> {
-        render::compose_resolved(dynamics, LEDS, look.resolved(), &look.motion_state)
+        render::compose_bands(
+            dynamics,
+            LEDS,
+            look.resolved().palette(),
+            look.resolved().bands(Half::Left),
+            look.resolved().bands(Half::Right),
+            &look.motion_state,
+        )
     }
 
     fn force_next<T: Clone + PartialEq>(runner: &mut AxisRunner<T>, value: T, at: Instant) {
@@ -1040,7 +1054,7 @@ mod tests {
 
         // A real beat after that sync spawns glints.
         let mut bands = vec![0.0; BAND_COUNT];
-        bands[..crate::render::BASS_BANDS].fill(0.8);
+        bands[..crate::dynamics::BASS_BANDS].fill(0.8);
         let mut spectrum = Spectrum::new(1, BAND_COUNT);
         spectrum.set_bands(0, &bands);
         dynamics.update(&spectrum, 1.0 / 30.0);

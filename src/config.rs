@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::dynamics::DynamicsConfig;
 use crate::live::LiveConfig;
-use crate::render::DynamicsConfig;
 
 /// The whole configuration.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]

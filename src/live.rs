@@ -25,8 +25,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crate::audio::Block;
+use crate::dynamics::{Dynamics, DynamicsConfig};
 use crate::look::{LookSettings, LookState};
-use crate::render::{Dynamics, DynamicsConfig, Pacer};
+use crate::render::Pacer;
 use crate::spectrum::{Analyzer, BandPlan, Spectrum};
 use crate::theme::Frame;
 

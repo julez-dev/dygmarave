@@ -185,9 +185,11 @@ Startup logging: `seed=…` once, then one line per switch:
   resolved `Layout` and `band_leds_for(&Layout, Half)`; keep the existing
   `band_leds` as the `snake` path or replace its call sites. Geometry tests for
   permutation and mirroring.
-- **`src/render.rs`** — `compose` takes the `Look` selection (layout, palette) plus
-  a read-only `&MotionState`; thumb painting and band placement live here.
-  `Dynamics`, `Pacer` unchanged.
+- **`src/dynamics.rs`** (new) — `Dynamics`, `DynamicsConfig`, `BASS_BANDS` and
+  `FLOOR`, with the gating/AGC/beat-counter tests.
+- **`src/render.rs`** — `compose_bands(dynamics, count, palette, left, right,
+  motion)` paints using resolved band tables; test-only `compose` wraps it for
+  the layout/palette API. `Pacer` unchanged.
 - **`src/config.rs`** — `[look]` struct, defaults, validation, mapping to the
   engine's settings type.
 - **`src/args.rs`** — new flags, probe aliases, help text.

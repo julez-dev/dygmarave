@@ -121,3 +121,30 @@ Implemented on branch `look-variety`; ticket 04 is untouched.
 
 Validation run locally: `cargo test` (246 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.
+
+## Review fixes (ticket 03)
+
+- **First bag draw.** `Bag` now shuffles its full remaining set before the first
+  pop, so the first draw consumes the run RNG and depends on the seed. Pinned
+  first-draw and seed-dependence tests cover it; the first cycle is still a
+  permutation. `different_seeds_differ` now uses interval-zero random axes and
+  compares `selection()`/`resolved()`.
+- **Two RNG streams.** The selection stream uses the look seed for bags, scatter
+  and jitter. The motion stream uses `seed ^ MOTION_SEED_SALT` for sparkle/rain
+  randomness, so selection draws cannot perturb the motion show. Both are still
+  reproducible from one seed.
+- **Startup-only reset.** `MotionState::reset_events` is private again; live
+  switches only have `reset_events_at`/`set_motion_at`/`set_settings_at`.
+- **Acyclic modules.** `Dynamics`, `DynamicsConfig`, `BASS_BANDS` and the
+  render floor moved to `src/dynamics.rs`. `render::compose_bands` is the single
+  render primitive and takes resolved band tables; `compose_resolved` and the
+  render → look import are gone. Production dependency edges are now
+  `motion -> dynamics`, `render -> dynamics, motion`, and
+  `look -> render, motion, dynamics`.
+- **Hardening.** The same-tick test asserts the engine actually took all three
+  selected values into `selection()`/`resolved()`. A late-poll test pins one
+  switch, no repeat on the same deadline, and a reschedule of
+  `[0.75, 1.25] × interval` from `now`.
+
+Validation run locally: `cargo test` (248 tests), `cargo clippy --all-targets --
+-D warnings`, `cargo fmt --check`.

@@ -19,6 +19,7 @@ mod audio;
 mod bazecor;
 mod bench;
 mod config;
+mod dynamics;
 mod layout;
 mod level;
 mod link;

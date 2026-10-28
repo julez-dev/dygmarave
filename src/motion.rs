@@ -13,8 +13,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Instant;
 
+use crate::dynamics::Dynamics;
 use crate::layout::{self, Cell, Half};
-use crate::render::Dynamics;
 use crate::theme::Rgb;
 
 const TAU: f32 = std::f32::consts::TAU;
@@ -627,7 +627,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::render::{compose, DynamicsConfig, Look, BASS_BANDS};
+    use crate::dynamics::{DynamicsConfig, BASS_BANDS};
+    use crate::render::{compose, Look};
     use crate::spectrum::{Spectrum, BAND_COUNT};
 
     fn spectrum_with(values: &[f32]) -> Spectrum {
