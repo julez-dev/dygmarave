@@ -21,7 +21,6 @@
 //! Its `LedMode` vocabulary is deliberately *not* used: it names modes 4–6 as
 //! Red/Green/Blue, while firmware v1.0.12-beta rejects anything above 3.
 
-use std::fmt;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
@@ -38,27 +37,17 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(1);
 const TERMINATOR: &[u8] = b"\r\n.\r\n";
 
 /// A failure talking to the board.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LinkError {
     /// No supported Dygma device could be found.
+    #[error(
+        "no Dygma keyboard found (looked for {looked_for} in USB devices and /dev/serial/by-id)"
+    )]
     NotFound { looked_for: String },
     /// The operating system refused or lost the port.
+    #[error("{0}")]
     Io(String),
 }
-
-impl fmt::Display for LinkError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LinkError::NotFound { looked_for } => write!(
-                f,
-                "no Dygma keyboard found (looked for {looked_for} in USB devices and /dev/serial/by-id)"
-            ),
-            LinkError::Io(message) => write!(f, "{message}"),
-        }
-    }
-}
-
-impl std::error::Error for LinkError {}
 
 /// The commands the daemon needs from a keyboard.
 pub trait Link {

@@ -40,35 +40,18 @@ impl fmt::Display for Rgb {
 }
 
 /// Why a device reply could not be read as a theme.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ThemeError {
     /// The reply contained no colour values at all.
+    #[error("the device returned no colour values")]
     Empty,
     /// The value count is not a whole number of RGB triplets.
+    #[error("the device returned {values} values, which is not a whole number of RGB triplets")]
     Ragged { values: usize },
     /// A value was not a byte-sized integer.
+    #[error("the device returned a value that is not a byte: {token:?}")]
     BadValue { token: String },
 }
-
-impl fmt::Display for ThemeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ThemeError::Empty => write!(f, "the device returned no colour values"),
-            ThemeError::Ragged { values } => write!(
-                f,
-                "the device returned {values} values, which is not a whole number of RGB triplets"
-            ),
-            ThemeError::BadValue { token } => {
-                write!(
-                    f,
-                    "the device returned a value that is not a byte: {token:?}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ThemeError {}
 
 /// Parses a `led.theme` reply into one colour per LED index.
 ///

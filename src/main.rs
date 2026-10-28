@@ -31,7 +31,6 @@ mod theme;
 #[cfg(test)]
 mod testing;
 
-use std::error::Error;
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,35 +38,46 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{bail, Context};
+
 use audio::{verdict, AudioError, SourceKind, Verdict};
 use link::{DygmaLink, Link};
 use session::{Baseline, Session};
 use theme::{Frame, Rgb};
 
 fn main() -> ExitCode {
-    match run() {
+    // clap owns the argument surface: it renders --help and --version to stdout and
+    // usage errors to stderr, each with its conventional exit code. A parse error
+    // never reaches run().
+    let args = match args::parse_args(std::env::args_os()) {
+        Ok(args) => args,
+        Err(error) => {
+            let _ = error.print();
+            return ExitCode::from(error.exit_code() as u8);
+        }
+    };
+    match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("dygmarave: {error}");
+            // `{:#}` prints the whole context chain, not just the outermost message.
+            eprintln!("dygmarave: {error:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
-    let args = args::parse(std::env::args().skip(1))?;
-    if args.help {
-        println!("{}", args::USAGE);
-        return Ok(());
+/// Opens the board from the configured port, or by USB discovery.
+fn open_device(config: &config::Config) -> anyhow::Result<DygmaLink> {
+    match config.port() {
+        Some(port) => DygmaLink::from_port(port).context("opening the configured port"),
+        None => DygmaLink::discover().context("finding the keyboard"),
     }
-    if args.live && args.probe_audio {
-        return Err("--live and --probe-audio are mutually exclusive;                     the first drives the board, the second only prints a meter"
-            .into());
-    }
+}
 
+fn run(args: args::Args) -> anyhow::Result<()> {
     // Load the config, then let explicit CLI flags override it. A malformed or
     // out-of-range file is an error here, before the board is touched.
-    let mut config = config::Config::load_default()?;
+    let mut config = config::Config::load_default().context("loading the configuration")?;
     if let Some(port) = &args.port {
         config.device.port = port.clone();
     }
@@ -82,7 +92,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "stopping"
     } else {
         "restoring the keyboard"
-    })?;
+    })
+    .context("installing the Ctrl-C handler")?;
 
     if args.columns || args.rows || args.gradient || args.thumb_pattern {
         return paint_pattern(&args, &config, &interrupted);
@@ -94,13 +105,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         return live_visualizer(&config, &interrupted);
     }
 
-    let device = match config.port() {
-        Some(port) => DygmaLink::from_port(port)?,
-        None => DygmaLink::discover()?,
-    };
+    let device = open_device(&config)?;
     println!("port: {}", device.port_name());
 
-    let mut session = Session::open(device)?;
+    let mut session = Session::open(device).context("opening a session with the board")?;
     println!("firmware: {}", session.firmware()?);
     let count = session.led_count();
     println!("LED count: {count} (reported by the board, not assumed)");
@@ -192,13 +200,10 @@ fn paint_pattern(
     args: &args::Args,
     config: &config::Config,
     interrupted: &AtomicBool,
-) -> Result<(), Box<dyn Error>> {
-    let device = match config.port() {
-        Some(port) => DygmaLink::from_port(port)?,
-        None => DygmaLink::discover()?,
-    };
+) -> anyhow::Result<()> {
+    let device = open_device(config)?;
     println!("port: {}", device.port_name());
-    let mut session = Session::open(device)?;
+    let mut session = Session::open(device).context("opening a session with the board")?;
     let count = session.led_count();
     println!(
         "LED count: {count}; the grid claims {} key LEDs across {} rows x {} columns",
@@ -439,8 +444,8 @@ fn probe_audio(
     args: &args::Args,
     config: &config::Config,
     interrupted: &AtomicBool,
-) -> Result<(), Box<dyn Error>> {
-    let selection = audio::choose(config.source())?;
+) -> anyhow::Result<()> {
+    let selection = audio::choose(config.source()).context("choosing an audio source")?;
     println!(
         "source: {selection}{}",
         if selection.follows_default_sink() {
@@ -454,7 +459,7 @@ fn probe_audio(
     }
 
     let (sender, receiver) = mpsc::channel();
-    let capture = audio::start(&selection, sender)?;
+    let capture = audio::start(&selection, sender).context("starting audio capture")?;
     println!(
         "  {} channels at {} Hz, {:?}",
         capture.channels, capture.sample_rate, capture.sample_format
@@ -639,13 +644,11 @@ enum Detach {
 fn open_session(
     config: &config::Config,
     baseline: Option<Baseline>,
-) -> Result<(Session<DygmaLink>, String), Box<dyn Error>> {
-    let device = match config.port() {
-        Some(port) => DygmaLink::from_port(port)?,
-        None => DygmaLink::discover()?,
-    };
+) -> anyhow::Result<(Session<DygmaLink>, String)> {
+    let device = open_device(config)?;
     let port_name = device.port_name().to_string();
-    let session = Session::open_with(device, baseline)?;
+    let session =
+        Session::open_with(device, baseline).context("opening a session with the board")?;
     Ok((session, port_name))
 }
 
@@ -662,15 +665,15 @@ fn sleep_backoff(backoff: &mut Backoff, interrupted: &AtomicBool) -> bool {
 }
 
 /// A port failure: report it so the caller can reconnect.
-fn lost<E: std::fmt::Display>(error: E, acks: u64) -> Result<(Detach, u64), Box<dyn Error>> {
+fn lost<E: std::fmt::Display>(error: E, acks: u64) -> anyhow::Result<(Detach, u64)> {
     Ok((Detach::Lost(error.to_string()), acks))
 }
 
 /// Fails if the audio stream has died. Losing audio is fatal, unlike losing the board.
-fn check_audio(audio: &dyn AudioHealth, frames: u64) -> Result<(), Box<dyn Error>> {
+fn check_audio(audio: &dyn AudioHealth, frames: u64) -> anyhow::Result<()> {
     match audio.error() {
         Some(error) => {
-            Err(format!("audio stream stopped mid-set after {frames} frames: {error}").into())
+            bail!("audio stream stopped mid-set after {frames} frames: {error}")
         }
         None => Ok(()),
     }
@@ -687,7 +690,7 @@ fn run_frames<L: Link>(
     receiver: &Receiver<audio::Block>,
     audio: &dyn AudioHealth,
     interrupted: &AtomicBool,
-) -> Result<(Detach, u64), Box<dyn Error>> {
+) -> anyhow::Result<(Detach, u64)> {
     let mut drain = Cadence::new(DRAIN_INTERVAL, Instant::now());
     let mut probe = Cadence::new(PROBE_INTERVAL, Instant::now());
     let mut report = Cadence::new(REPORT_INTERVAL, Instant::now());
@@ -774,15 +777,12 @@ fn run_frames<L: Link>(
 /// The board comes and goes: Bazecor may take the port, or the board may be
 /// unplugged. The audio pipeline stays up throughout; the outer loop waits and
 /// reopens the board when it is available again.
-fn live_visualizer(
-    config: &config::Config,
-    interrupted: &AtomicBool,
-) -> Result<(), Box<dyn Error>> {
-    let selection = audio::choose(config.source())?;
+fn live_visualizer(config: &config::Config, interrupted: &AtomicBool) -> anyhow::Result<()> {
+    let selection = audio::choose(config.source()).context("choosing an audio source")?;
     println!("source: {selection}");
 
     let (sender, receiver) = mpsc::channel();
-    let capture = audio::start(&selection, sender)?;
+    let capture = audio::start(&selection, sender).context("starting audio capture")?;
     println!(
         "  {} channels at {} Hz — drive the board until Ctrl-C",
         capture.channels, capture.sample_rate
@@ -932,7 +932,7 @@ fn live_visualizer(
 
 /// Turns Ctrl-C into a flag so the baseline can be restored before exiting.
 /// A second Ctrl-C gives up and exits immediately.
-fn install_interrupt_handler(what: &'static str) -> Result<Arc<AtomicBool>, Box<dyn Error>> {
+fn install_interrupt_handler(what: &'static str) -> anyhow::Result<Arc<AtomicBool>> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&interrupted);
     ctrlc::set_handler(move || {

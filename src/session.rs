@@ -1,7 +1,6 @@
 //! One sit-down with the keyboard: capture what it looked like, take it out of
 //! any repainting LED mode, write frames, and put everything back.
 
-use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -66,31 +65,17 @@ impl LedMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SessionError {
+    #[error("{0}")]
     Link(LinkError),
+    #[error("{0}")]
     Theme(ThemeError),
+    #[error("the board reported an unreadable LED mode: {0:?}")]
     UnreadableMode(String),
+    #[error("refusing to write a {wrote}-LED frame to a board with {board} LEDs")]
     FrameSize { wrote: usize, board: usize },
 }
-
-impl fmt::Display for SessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SessionError::Link(error) => write!(f, "{error}"),
-            SessionError::Theme(error) => write!(f, "{error}"),
-            SessionError::UnreadableMode(reply) => {
-                write!(f, "the board reported an unreadable LED mode: {reply:?}")
-            }
-            SessionError::FrameSize { wrote, board } => write!(
-                f,
-                "refusing to write a {wrote}-LED frame to a board with {board} LEDs"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
 
 impl From<LinkError> for SessionError {
     fn from(error: LinkError) -> Self {
@@ -625,5 +610,14 @@ mod tests {
         assert!(!report.is_static());
         assert_eq!(report.accepted(), 1);
         assert_eq!(report.unresponsive(), vec![1]);
+    }
+
+    #[test]
+    fn a_link_failure_prints_once_without_chaining() {
+        // Kept non-chaining like the old manual `impl Error`: `{:#}` must not repeat
+        // the inner message.
+        let error = SessionError::Link(LinkError::Io("port vanished".to_string()));
+        assert_eq!(error.to_string(), "port vanished");
+        assert!(std::error::Error::source(&error).is_none());
     }
 }

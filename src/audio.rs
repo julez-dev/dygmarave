@@ -105,59 +105,35 @@ impl Candidate {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     /// No device carries the output mix.
+    #[error("no monitor source is available to capture; found only: {}", .candidates.join("; "))]
     NoMonitor { candidates: Vec<String> },
     /// The chosen device is a microphone.
+    #[error(
+        "refusing to capture {selection} because it is a {}; that would visualize the room, not the speakers",
+        .selection.kind.describe()
+    )]
     NotAMonitor { selection: Box<Selection> },
     /// The requested device does not exist.
+    #[error("no capture device with id {requested:?}; available: {}", .candidates.join("; "))]
     NoSuchDevice {
         requested: String,
         candidates: Vec<String>,
     },
     /// The audio server or the device refused the stream.
+    #[error("{0}")]
     Device(String),
     /// The stream ran but never carried any signal.
+    #[error(
+        "captured {selection} and received {blocks} buffers, but every sample was zero — is anything playing, and is that sink the one it is playing to?"
+    )]
     NoSignal {
         selection: Box<Selection>,
         blocks: u64,
     },
 }
-
-impl fmt::Display for AudioError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AudioError::NoMonitor { candidates } => write!(
-                f,
-                "no monitor source is available to capture; found only: {}",
-                candidates.join("; ")
-            ),
-            AudioError::NotAMonitor { selection } => write!(
-                f,
-                "refusing to capture {selection} because it is a {}; \
-                 that would visualize the room, not the speakers",
-                selection.kind.describe()
-            ),
-            AudioError::NoSuchDevice {
-                requested,
-                candidates,
-            } => write!(
-                f,
-                "no capture device with id {requested:?}; available: {}",
-                candidates.join("; ")
-            ),
-            AudioError::Device(message) => write!(f, "{message}"),
-            AudioError::NoSignal { selection, blocks } => write!(
-                f,
-                "captured {selection} and received {blocks} buffers, but every sample was zero — \
-                 is anything playing, and is that sink the one it is playing to?"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AudioError {}
 
 /// Whether captured audio carried anything at all.
 #[derive(Debug, Clone, Copy, PartialEq)]

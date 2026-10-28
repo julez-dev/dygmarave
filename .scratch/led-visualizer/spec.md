@@ -8,7 +8,7 @@ A Linux daemon that reads the system's audio *output*, computes a spectrum, and 
 
 Non-goals for v1: Windows/macOS, microphone input, GUI or tray app, distro packaging, Raise 2 / Defy / wireless support, custom firmware.
 
-Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/issues/`, numbered in dependency order. Start at 01 and work the frontier.
+Work is broken into ten tracer-bullet tickets under `.scratch/led-visualizer/issues/`, numbered in dependency order. Start at 01 and work the frontier.
 
 ## Settled decisions
 
@@ -33,6 +33,7 @@ Work is broken into nine tracer-bullet tickets under `.scratch/led-visualizer/is
 | Rate | 30 fps target; measured ceiling 69.5 fps, adaptive downward — floor 5 fps, step a sixth of the target, two resyncs or <90% achieved in a 2 s window to degrade, 6 s clean to recover; the budget is typing latency, not the wire | ticket 07 |
 | Lifecycle | Read baseline theme at startup, write it back on clean exit; on SIGTERM/SIGINT restore and exit cleanly; systemd user unit at login with `Restart=on-failure` so its policy does not fight the daemon's internal retry | ticket 08 |
 | Config | XDG TOML at `~/.config/dygmarave/config.toml`, CLI overrides; validation names the offending key; `[analysis]` drives the band plan | ticket 09 |
+| CLI & errors | `clap` derive owns arguments and help; `thiserror` keeps the five domain errors typed; `anyhow` chains context at the `run()` boundary; usage errors exit 2 | ticket 10 |
 | Discovery | `/dev/serial/by-id` match on Dygma VID/PID, explicit path override | — |
 | Scope | `cargo run` + systemd **user** unit, Linux only | — |
 

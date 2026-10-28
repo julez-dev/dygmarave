@@ -134,50 +134,35 @@ impl Default for ThumbConfig {
 }
 
 /// A configuration problem, always naming the key that caused it.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The file could not be read.
+    #[error("cannot read {}: {cause}", .path.display())]
     Read {
         path: PathBuf,
-        source: std::io::Error,
+        cause: std::io::Error,
     },
     /// The file was not valid TOML or did not match the schema.
+    #[error("cannot parse {}: {cause}", .path.display())]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        cause: toml::de::Error,
     },
     /// A value parsed but is out of range.
+    #[error("invalid {key}: {message}")]
     Invalid { key: String, message: String },
 }
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigError::Read { path, source } => {
-                write!(f, "cannot read {}: {source}", path.display())
-            }
-            ConfigError::Parse { path, source } => {
-                write!(f, "cannot parse {}: {source}", path.display())
-            }
-            ConfigError::Invalid { key, message } => {
-                write!(f, "invalid {key}: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
 
 impl Config {
     /// Loads the config from a specific path.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        let text = std::fs::read_to_string(path).map_err(|cause| ConfigError::Read {
             path: path.to_path_buf(),
-            source,
+            cause,
         })?;
-        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        let config: Self = toml::from_str(&text).map_err(|cause| ConfigError::Parse {
             path: path.to_path_buf(),
-            source,
+            cause,
         })?;
         config.validate()?;
         Ok(config)
@@ -193,10 +178,7 @@ impl Config {
             // is a real problem worth reporting, not a silent fallback.
             Ok(metadata) if metadata.is_file() => Self::load(&path),
             Ok(_) => Self::load(&path),
-            Err(error) => Err(ConfigError::Read {
-                path,
-                source: error,
-            }),
+            Err(error) => Err(ConfigError::Read { path, cause: error }),
         }
     }
 
@@ -477,5 +459,22 @@ beat_threshold = 3.0
         // shape of the path, not a particular home directory.
         let path = Config::default_path();
         assert!(path.ends_with("dygmarave/config.toml"));
+    }
+
+    #[test]
+    fn a_config_error_prints_its_cause_exactly_once() {
+        // The pre-thiserror manual `impl Error` never exposed source(), so `{:#}`
+        // must not append the cause a second time. A field named `source` would
+        // auto-wire thiserror's source() and duplicate the leaf message.
+        let error = ConfigError::Read {
+            path: PathBuf::from("/nope/config.toml"),
+            cause: std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+        };
+        let rendered = error.to_string();
+        assert_eq!(rendered.matches("gone").count(), 1, "got {rendered:?}");
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the cause must not chain"
+        );
     }
 }
