@@ -428,14 +428,14 @@ mod tests {
                 DeviceType::Microphone,
             ),
             candidate(
-                "pipewire:alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink",
-                "USB Audio Speakers",
+                "pipewire:alsa_output.usb-Example_Speakers-00.HiFi__Speaker__sink",
+                "Example USB Speakers",
                 DeviceDirection::Duplex,
                 DeviceType::Speaker,
             ),
             candidate(
-                "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
-                "Auna Mic CM900 Mono",
+                "pipewire:alsa_input.usb-Example_Microphone-00.mono-fallback",
+                "Example USB Microphone",
                 DeviceDirection::Input,
                 DeviceType::Microphone,
             ),
@@ -500,17 +500,13 @@ mod tests {
     #[test]
     fn falls_back_to_names_when_the_host_reports_no_metadata() {
         assert_eq!(
-            Candidate::from_name(
-                "pulse:alsa_output.pci-0000_01_00.1.hdmi-stereo.monitor",
-                "HDMI monitor"
-            )
-            .kind(),
+            Candidate::from_name("pulse:alsa_output.hdmi-stereo.monitor", "HDMI monitor").kind(),
             SourceKind::Monitor
         );
         assert_eq!(
             Candidate::from_name(
-                "pulse:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
-                "Auna Mic CM900 Mono"
+                "pulse:alsa_input.usb-Example_Microphone-00.mono-fallback",
+                "Example USB Microphone"
             )
             .kind(),
             SourceKind::Microphone
@@ -542,14 +538,14 @@ mod tests {
     fn falls_back_to_another_monitor_when_no_default_sink_device_exists() {
         let candidates = vec![
             candidate(
-                "pipewire:alsa_output.usb-Generic_USB_Audio-00.HiFi__Speaker__sink",
-                "USB Audio Speakers",
+                "pipewire:alsa_output.usb-Example_Speakers-00.HiFi__Speaker__sink",
+                "Example USB Speakers",
                 DeviceDirection::Duplex,
                 DeviceType::Speaker,
             ),
             candidate(
-                "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
-                "Auna Mic CM900 Mono",
+                "pipewire:alsa_input.usb-Example_Microphone-00.mono-fallback",
+                "Example USB Microphone",
                 DeviceDirection::Input,
                 DeviceType::Microphone,
             ),
@@ -561,7 +557,7 @@ mod tests {
 
     #[test]
     fn refuses_to_capture_a_microphone_even_when_asked_by_name() {
-        let error = select(&devices(), Some("Auna Mic CM900 Mono")).unwrap_err();
+        let error = select(&devices(), Some("Example USB Microphone")).unwrap_err();
         let AudioError::NotAMonitor { selection } = error else {
             panic!("expected a microphone refusal");
         };
@@ -601,8 +597,8 @@ mod tests {
     #[test]
     fn explains_itself_when_there_is_no_monitor_at_all() {
         let candidates = vec![candidate(
-            "pipewire:alsa_input.usb-Auna_Mic_CM900-00.mono-fallback",
-            "Auna Mic CM900 Mono",
+            "pipewire:alsa_input.usb-Example_Microphone-00.mono-fallback",
+            "Example USB Microphone",
             DeviceDirection::Input,
             DeviceType::Microphone,
         )];

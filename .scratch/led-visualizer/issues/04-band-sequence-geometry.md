@@ -16,7 +16,7 @@
 **Resolved with a photograph of the board.** Dygma's own two sources disagreed
 about which LED sits on which key; the photo settled it in favour of Bazecor.
 
-| LED | Dygma firmware (`key_led_map[4][16]`) | Bazecor (`Keymap-ANSI.jsx` `led_map[5][16]`) | Observed on this board |
+| LED | Dygma firmware (`key_led_map[4][16]`) | Bazecor (`Keymap-ANSI.jsx` `led_map[5][16]`) | Observed on a wired ANSI Raise |
 | --- | --- | --- | --- |
 | 0 | matrix (row 3, col 0) | physical (row 0, col 0) | **Escape, top-left** |
 | 26 | matrix (row 0, col 6) | physical (row 4, col 0) | **left Ctrl, bottom-left** |
@@ -59,7 +59,7 @@ confirmed — *"red at 6/7, blue at edges"*.
   colour: columns 0↔15, 1↔14 … all correct.
 - Letter-row key counts: left 7,6,6,7 = **26**; right 7,7,7,6 = **27**. Neither
   half has the 28 the ADR assumed.
-- The `\` key was dark, which is LED 20 — the index this board refuses to light.
+- The `\` key was dark, which is LED 20 — an index one measured unit refused to light.
   The map predicts it; the photo shows it. That is the strongest single piece of
   evidence for the table.
 - LED 40 sits on no key, and Bazecor's raw map lists LED 29 twice; Bazecor's own

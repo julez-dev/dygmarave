@@ -1,9 +1,17 @@
 # dygmarave
 
-Audio-reactive per-key LED visualisation for the Dygma Raise. dygmarave captures
-the output mix (never the microphone), analyses it into 28 log-spaced bands, and
-paints each half of the keyboard through a palette, a layout and an optional
-motion.
+Audio-reactive per-key LED visualisation for the wired, ANSI Dygma Raise v1.
+dygmarave captures the output mix (never the microphone), analyses it into 28
+log-spaced bands, and paints each half of the keyboard through a palette, a
+layout and an optional motion.
+
+## Requirements
+
+- Wired, ANSI Dygma Raise v1. Other Raise revisions, ISO layouts, the Raise 2 and
+the Defy are not supported by the current physical map and USB discovery.
+- Linux with PipeWire or PulseAudio. Capture uses the output sink's monitor;
+an ALSA-only or JACK-only host is not supported.
+- Permission to open the board's serial port, and Bazecor must not be holding it.
 
 ## Build
 

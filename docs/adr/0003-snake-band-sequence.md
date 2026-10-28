@@ -29,7 +29,7 @@ Consequences:
   the spectrum is preferable to compressing 28 bands into 26 unevenly, and the
   lost bands are the least visible.
 - **The board has 68 key LEDs, not 64.** LED 40 sits on no key, and LED 20 —
-  the `\` key — never lights up at all on this unit, confirmed in the photo.
+  the `\` key — never lit up on one measured unit, confirmed in the photo.
 - **The snake runs along rows, not columns.** ADR-0003 asked for columns; that is
   impossible here because the inner column is partial (the left half has keys at
   its rows 0 and 3 with a hole between), so a column-wise walk jumps three rows.

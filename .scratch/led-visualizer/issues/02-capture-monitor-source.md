@@ -15,7 +15,7 @@
 
 Run with `cargo run -- --probe-audio [--seconds N] [--source ID]`.
 
-**The failure was real on this machine.** `pactl` reports the default sink as the USB speakers and the default source as an **Auna CM900 microphone**, so the naive "open the default input" implementation would have visualized the room. Selection now classifies devices and prefers `pipewire:sink_default` — PipeWire's capture device for the default sink's monitor, which also means the visualizer follows whatever output the user selects rather than pinning one device.
+**The failure was real in practice.** `pactl` reported the default sink as a pair of USB speakers and the default source as a **USB microphone**, so the naive "open the default input" implementation would have visualized the room. Selection now classifies devices and prefers `pipewire:sink_default` — PipeWire's capture device for the default sink's monitor, which also means the visualizer follows whatever output the user selects rather than pinning one device.
 
 **Evidence**
 
@@ -24,7 +24,7 @@ Run with `cargo run -- --probe-audio [--seconds N] [--source ID]`.
 | Default sink monitor | `default_sink`, 2 ch @ 48 kHz F32, −5.7 dBFS peak while Firefox played |
 | Left-only 440 Hz tone | **L −10.5 dBFS, R −100.0 dBFS** — channel separation correct |
 | Idle sink (`--source` HDMI) | exit 1, "captured … but heard nothing — is anything playing, and is that sink the one it is playing to?" |
-| Microphone by name (`--source "Auna Mic CM900 Mono"`) | refused: "that would visualize the room, not the speakers" |
+| Microphone by name (`--source "Example USB Microphone"`) | refused: "that would visualize the room, not the speakers" |
 
 **Findings worth carrying forward**
 
