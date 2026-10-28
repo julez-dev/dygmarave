@@ -1,11 +1,18 @@
 //! The look selection engine: three independent axes, shuffle bags, jittered
 //! timers, and a crossfade from the colours actually on screen.
 //!
-//! The engine owns the only run RNG. Every random draw, scatter permutation and
-//! timer jitter comes from it, so one seed reproduces the whole sequence. Motion
-//! event state lives in [`MotionState`], which is advanced exactly once per frame
-//! by [`LookState::render`]; switches reset its events with the current
-//! [`Dynamics`] before that advance.
+//! The engine owns two explicit RNG streams derived from one seed:
+//!
+//! * the selection stream, seeded with the look seed, drives shuffle-bag draws,
+//!   scatter permutations and timer jitter;
+//! * the motion stream, seeded with `seed ^ MOTION_SEED_SALT`, drives motion event
+//!   randomness such as sparkle keys and rain droplets.
+//!
+//! Keeping them separate means selection draws cannot perturb the motion show,
+//! while the same look seed still reproduces both. Motion event state lives in
+//! [`MotionState`], which is advanced exactly once per frame by
+//! [`LookState::render`]; switches reset its events with the current [`Dynamics`]
+//! before that advance.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -15,6 +22,9 @@ use crate::motion::{Motion, MotionSettings, MotionState};
 use crate::palette::Palette;
 use crate::render::{self, Dynamics};
 use crate::theme::Rgb;
+
+/// Salt that separates the motion-event RNG stream from the selection stream.
+const MOTION_SEED_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// One of the three look axes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,10 +133,12 @@ impl<T: Clone + PartialEq> Bag<T> {
         if self.items.len() == 1 {
             return self.items[0].clone();
         }
-        if self.remaining.is_empty() {
-            self.remaining.clone_from(&self.items);
+        if self.last.is_none() || self.remaining.is_empty() {
+            if self.remaining.is_empty() {
+                self.remaining.clone_from(&self.items);
+            }
             shuffle(&mut self.remaining, rng);
-            if self.remaining.last() == self.last.as_ref() {
+            if self.last.is_some() && self.remaining.last() == self.last.as_ref() {
                 let last = self.remaining.len() - 1;
                 self.remaining.swap(last, 0);
             }
@@ -343,7 +355,10 @@ impl LookState {
             palette: palette_value,
             motion: motion_value,
         };
-        let motion_state = MotionState::new(settings.motion_settings(motion_value), seed);
+        let motion_state = MotionState::new(
+            settings.motion_settings(motion_value),
+            seed ^ MOTION_SEED_SALT,
+        );
 
         Self {
             settings,
@@ -601,6 +616,25 @@ mod tests {
     }
 
     #[test]
+    fn a_bags_first_draw_is_seeded() {
+        let mut bag = Bag::new(vec![1, 2, 3, 4]);
+        assert_eq!(bag.draw(&mut fastrand::Rng::with_seed(7)), 4);
+
+        let mut firsts: Vec<_> = (0..32)
+            .map(|seed| {
+                let mut bag = Bag::new(vec![1, 2, 3, 4]);
+                bag.draw(&mut fastrand::Rng::with_seed(seed))
+            })
+            .collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        assert!(
+            firsts.len() > 1,
+            "the first draw must depend on the seed, got {firsts:?}"
+        );
+    }
+
+    #[test]
     fn a_one_element_bag_neither_reshuffles_nor_consumes_rng() {
         let mut bag = Bag::new(vec![42]);
         let mut used = fastrand::Rng::with_seed(3);
@@ -805,7 +839,44 @@ mod tests {
         assert!(switches
             .iter()
             .all(|switch| switch.reason == SwitchReason::Random));
+        assert_eq!(look.selection().layout, next_layout);
+        assert_eq!(look.selection().palette, next_palette);
+        assert_eq!(look.selection().motion, next_motion);
+        assert_eq!(look.resolved().selection(), look.selection());
+        assert_eq!(
+            look.resolved().layout(),
+            &next_layout.resolve(&mut fastrand::Rng::with_seed(0)),
+            "the resolved layout must match the drawn kind"
+        );
         assert!(look.fade_from.is_some(), "one fade covers the whole tick");
+    }
+
+    #[test]
+    fn a_late_tick_emits_one_switch_and_reschedules_from_now() {
+        let start = Instant::now();
+        let interval = Duration::from_secs(10);
+        let settings = LookSettings {
+            palette: AxisSettings::random(
+                vec![Palette::Ember, Palette::Ice, Palette::Solar],
+                interval,
+            ),
+            ..LookSettings::default()
+        };
+        let mut look = LookState::new(settings, 40, start);
+        let dynamics = varied_dynamics();
+        let late = start + Duration::from_secs(60);
+        force_deadline(&mut look.palette, start + Duration::from_secs(1));
+
+        let switches = look.tick(late, &dynamics);
+        assert_eq!(switches.len(), 1, "a late tick must not burst");
+        let again = look.tick(late, &dynamics);
+        assert!(again.is_empty(), "the same deadline cannot fire twice");
+        let next = look.palette.deadline.expect("rescheduled");
+        let delta = next.saturating_duration_since(late).as_secs_f64();
+        assert!(
+            (7.5..=12.5).contains(&delta),
+            "rescheduling must be one jittered interval from now, got {delta}"
+        );
     }
 
     #[test]
@@ -1031,20 +1102,22 @@ mod tests {
     }
 
     #[test]
-    fn different_seeds_differ() {
+    fn different_seeds_differ_for_interval_zero_random_axes() {
         let start = Instant::now();
         let settings = LookSettings {
             layout: AxisSettings::random(
                 vec![LayoutKind::Snake, LayoutKind::Rows, LayoutKind::Scatter],
-                Duration::from_secs(10),
+                Duration::ZERO,
             ),
+            palette: AxisSettings::random(vec![Palette::Ember, Palette::Ice], Duration::ZERO),
+            motion: AxisSettings::random(vec![Motion::None, Motion::Sweep], Duration::ZERO),
             ..LookSettings::default()
         };
         let a = LookState::new(settings.clone(), 1, start);
         let b = LookState::new(settings, 2, start);
-        assert_ne!(
-            (a.selection(), a.layout.deadline),
-            (b.selection(), b.layout.deadline)
-        );
+        assert!(a.layout.deadline.is_none());
+        assert!(b.layout.deadline.is_none());
+        assert_ne!(a.selection(), b.selection());
+        assert_ne!(a.resolved(), b.resolved());
     }
 }

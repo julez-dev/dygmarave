@@ -329,9 +329,8 @@ impl MotionState {
     ///
     /// This deliberately suppresses a beat until the next advance snapshots the
     /// counters. A beat that happens after this call but before that advance is
-    /// lost. Switch paths must use [`MotionState::reset_events_at`] instead.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn reset_events(&mut self) {
+    /// lost. Only [`MotionState::reset_events_at`] is available to live switches.
+    fn reset_events(&mut self) {
         self.clear_events();
         self.seen_beats = [None; HALVES];
     }
