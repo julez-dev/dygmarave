@@ -81,6 +81,16 @@ pub struct Switch {
     pub reason: SwitchReason,
 }
 
+impl fmt::Display for Switch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {} -> {} ({})",
+            self.axis, self.from, self.to, self.reason
+        )
+    }
+}
+
 /// How one axis is selected.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AxisSettings<T> {
@@ -606,6 +616,17 @@ mod tests {
             fade_ms,
             ..LookSettings::default()
         }
+    }
+
+    #[test]
+    fn a_switch_formats_like_the_log_line() {
+        let switch = Switch {
+            axis: Axis::Layout,
+            from: "snake",
+            to: "rings",
+            reason: SwitchReason::Random,
+        };
+        assert_eq!(switch.to_string(), "layout snake -> rings (random)");
     }
 
     #[test]

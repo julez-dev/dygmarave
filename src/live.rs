@@ -205,6 +205,8 @@ pub struct Live {
     dynamics: Dynamics,
     /// The three-axis selection engine: drawers, timers, motion state and fade.
     look: LookState,
+    /// Suppress the startup seed line and per-switch lines.
+    quiet: bool,
     pacer: Pacer,
     /// Adaptive frame-rate control. Only the rate moves; spectral resolution is
     /// never reduced.
@@ -243,12 +245,36 @@ impl Live {
         count: usize,
         start: Instant,
     ) -> Self {
+        Self::with_look(
+            config,
+            dynamics_config,
+            LookSettings::default(),
+            0,
+            false,
+            plan,
+            count,
+            start,
+        )
+    }
+
+    /// Creates a visualizer with the configured look settings, seed and quiet flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_look(
+        config: LiveConfig,
+        dynamics_config: DynamicsConfig,
+        look_settings: LookSettings,
+        seed: u64,
+        quiet: bool,
+        plan: BandPlan,
+        count: usize,
+        start: Instant,
+    ) -> Self {
         let bands = plan.band_count();
         Self {
             analyzer: Analyzer::new(plan, config.channels),
             dynamics: Dynamics::new(dynamics_config, config.channels, bands),
-            // Ticket 04 replaces the default seed with the configured/run seed.
-            look: LookState::new(LookSettings::default(), 0, start),
+            look: LookState::new(look_settings, seed, start),
+            quiet,
             pacer: Pacer::new(period_of(config.fps), start),
             rate: RateControl::new(
                 RateConfig {
@@ -312,8 +338,13 @@ impl Live {
             self.dynamics.update(&self.silent, dt);
         }
 
-        // Timers may fire several axes at once; ticket 04 will log the switches.
-        let _switches = self.look.tick(now, &self.dynamics);
+        // Timers may fire several axes at once; each gets its own log line.
+        let switches = self.look.tick(now, &self.dynamics);
+        if !self.quiet {
+            for switch in &switches {
+                eprintln!("{switch}");
+            }
+        }
         let colours = self.look.render(now, &self.dynamics, self.leds);
         Frame::from_colors(&colours)
     }
@@ -569,6 +600,32 @@ mod tests {
         let mut live = Live::new(LiveConfig::default(), plan(), 132, start);
         let frame = live.step(None, start, 0);
         assert_eq!(frame.leds(), 132);
+    }
+
+    #[test]
+    fn the_look_settings_seed_and_quiet_reach_the_engine() {
+        use crate::look::AxisSettings;
+        use crate::palette::Palette;
+
+        let start = Instant::now();
+        let settings = LookSettings {
+            palette: AxisSettings::random(vec![Palette::Ember, Palette::Ice], Duration::ZERO),
+            ..LookSettings::default()
+        };
+        let expected = LookState::new(settings.clone(), 87, start).selection();
+        let live = Live::with_look(
+            LiveConfig::default(),
+            DynamicsConfig::default(),
+            settings.clone(),
+            87,
+            true,
+            plan(),
+            132,
+            start,
+        );
+        assert!(live.quiet);
+        assert_eq!(live.look.settings(), &settings);
+        assert_eq!(live.look.selection(), expected);
     }
 
     #[test]

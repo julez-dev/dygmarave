@@ -37,7 +37,7 @@ The alphanumeric key area of a half, excluding the thumb clusters. The matrix is
 _Avoid_: Grid, main area, block
 
 **Band sequence**:
-The order in which bands are assigned to matrix keys: down one column, back up the next, so neighbouring bands occupy neighbouring keys. Each half's matrix holds one distinct band per key.
+A named ordering that assigns each band to one matrix key, so neighbouring bands occupy neighbouring keys. The `snake` sequence is the v0.1 default: it runs along rows, alternating direction and starting at the inner edge. A layout is one named band sequence.
 _Avoid_: Reading order (rejected: it puts a frequency discontinuity at every row boundary)
 
 **Thumb cluster**:
@@ -47,6 +47,24 @@ _Avoid_: Thumbs, cluster keys
 **Underglow**:
 The light pipes running around and beneath the key well. They are LEDs like any other but carry no band, so they stay dark.
 _Avoid_: Edge lights, glow strip
+
+### Look
+
+**Layout**:
+One of the named band sequences that decides which matrix key carries each band.
+_Avoid_: Arrangement, mapping
+
+**Palette**:
+One of the named ramps that decides which colour an energy level becomes.
+_Avoid_: Gradient, colormap
+
+**Motion**:
+An additive modulation over the composed matrix, such as a sweep or sparkle. Motion never chooses colours and never touches the thumb clusters.
+_Avoid_: Effect, animation
+
+**Switch**:
+A change of one look axis, either a timer draw from a random pool or a fixed selection taking effect.
+_Avoid_: Transition, update
 
 ### Render
 
@@ -59,8 +77,8 @@ One complete colouring of the whole keyboard, produced from one audio window.
 _Avoid_: Tick, update, refresh
 
 **Ramp**:
-The mapping from energy to colour, running from black through red and orange toward white.
-_Avoid_: Palette, gradient, colormap, heatmap
+A mapping from energy to colour, running from black upward. A palette is a named ramp; the default `ember` runs from black through red and orange toward white.
+_Avoid_: Gradient, colormap, heatmap
 
 **Attack**:
 How quickly a band's displayed energy rises. Attack is immediate.

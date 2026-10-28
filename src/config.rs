@@ -11,11 +11,16 @@
 //! defaults apply. A present but malformed file is an error.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::dynamics::DynamicsConfig;
+use crate::layout::LayoutKind;
 use crate::live::LiveConfig;
+use crate::look::{AxisSettings, LookSettings};
+use crate::motion::Motion;
+use crate::palette::Palette;
 
 /// The whole configuration.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -26,6 +31,7 @@ pub struct Config {
     pub analysis: AnalysisConfig,
     pub render: RenderConfig,
     pub thumbs: ThumbConfig,
+    pub look: LookConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -133,6 +139,55 @@ impl Default for ThumbConfig {
     }
 }
 
+/// The `[look]` table: three independent selection axes.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LookConfig {
+    /// A layout name, or "random".
+    pub layout: String,
+    /// The layout pool, read only when `layout = "random"`.
+    pub layouts: Vec<String>,
+    /// Seconds between random layout draws. 0 draws once and never switches.
+    pub layout_interval_s: f32,
+    /// A palette name, or "random".
+    pub palette: String,
+    /// The palette pool, read only when `palette = "random"`.
+    pub palettes: Vec<String>,
+    /// Seconds between random palette draws.
+    pub palette_interval_s: f32,
+    /// A motion name, or "random".
+    pub motion: String,
+    /// The motion pool, read only when `motion = "random"`.
+    pub motions: Vec<String>,
+    /// Seconds between random motion draws.
+    pub motion_interval_s: f32,
+    /// Crossfade duration in milliseconds. 0 cuts immediately.
+    pub fade_ms: u32,
+    /// Multiplier for the active motion's strength, 0..=2.
+    pub motion_intensity: f32,
+    /// Multiplier for the active motion's speed, 0.25..=4.
+    pub motion_speed: f32,
+}
+
+impl Default for LookConfig {
+    fn default() -> Self {
+        Self {
+            layout: "snake".to_string(),
+            layouts: Vec::new(),
+            layout_interval_s: 0.0,
+            palette: "ember".to_string(),
+            palettes: Vec::new(),
+            palette_interval_s: 0.0,
+            motion: "none".to_string(),
+            motions: Vec::new(),
+            motion_interval_s: 0.0,
+            fade_ms: 300,
+            motion_intensity: 1.0,
+            motion_speed: 1.0,
+        }
+    }
+}
+
 /// A configuration problem, always naming the key that caused it.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -151,6 +206,84 @@ pub enum ConfigError {
     /// A value parsed but is out of range.
     #[error("invalid {key}: {message}")]
     Invalid { key: String, message: String },
+}
+
+fn validate_axis_choice<T>(
+    key: &str,
+    what: &str,
+    value: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<(), ConfigError> {
+    if value == "random" || parse(value).is_some() {
+        return Ok(());
+    }
+    Err(ConfigError::Invalid {
+        key: key.to_string(),
+        message: format!("unknown {what} {value:?}; expected a built-in name or \"random\""),
+    })
+}
+
+fn validate_pool<T: PartialEq + Copy>(
+    key: &str,
+    what: &str,
+    names: &[String],
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<(), ConfigError> {
+    let mut seen = Vec::with_capacity(names.len());
+    for name in names {
+        if name == "random" {
+            return Err(ConfigError::Invalid {
+                key: key.to_string(),
+                message: format!("\"random\" is not a valid {what} pool entry"),
+            });
+        }
+        let Some(value) = parse(name) else {
+            return Err(ConfigError::Invalid {
+                key: key.to_string(),
+                message: format!("unknown {what} {name:?} in the pool"),
+            });
+        };
+        if seen.contains(&value) {
+            return Err(ConfigError::Invalid {
+                key: key.to_string(),
+                message: format!("duplicate {what} {name:?} in the pool"),
+            });
+        }
+        seen.push(value);
+    }
+    Ok(())
+}
+
+fn validate_interval(key: &str, seconds: f32) -> Result<(), ConfigError> {
+    if !seconds.is_finite() || !(0.0..=86_400.0).contains(&seconds) {
+        return Err(ConfigError::Invalid {
+            key: key.to_string(),
+            message: format!("must be a finite number of seconds in 0..=86400, got {seconds}"),
+        });
+    }
+    Ok(())
+}
+
+fn axis_settings<T: Clone>(
+    mode: &str,
+    configured_pool: &[String],
+    interval_s: f32,
+    parse: impl Fn(&str) -> Option<T>,
+    default_pool: impl FnOnce() -> Vec<T>,
+) -> AxisSettings<T> {
+    if mode == "random" {
+        let pool = if configured_pool.is_empty() {
+            default_pool()
+        } else {
+            configured_pool
+                .iter()
+                .map(|name| parse(name).expect("look pool validated"))
+                .collect()
+        };
+        AxisSettings::random(pool, Duration::from_secs_f32(interval_s))
+    } else {
+        AxisSettings::fixed(parse(mode).expect("look axis validated"))
+    }
 }
 
 impl Config {
@@ -291,7 +424,87 @@ impl Config {
             ));
         }
 
+        self.validate_look()
+    }
+
+    fn validate_look(&self) -> Result<(), ConfigError> {
+        let look = &self.look;
+        validate_axis_choice("look.layout", "layout", &look.layout, LayoutKind::from_name)?;
+        validate_pool(
+            "look.layouts",
+            "layout",
+            &look.layouts,
+            LayoutKind::from_name,
+        )?;
+        validate_interval("look.layout_interval_s", look.layout_interval_s)?;
+        validate_axis_choice("look.palette", "palette", &look.palette, Palette::from_name)?;
+        validate_pool(
+            "look.palettes",
+            "palette",
+            &look.palettes,
+            Palette::from_name,
+        )?;
+        validate_interval("look.palette_interval_s", look.palette_interval_s)?;
+        validate_axis_choice("look.motion", "motion", &look.motion, Motion::from_name)?;
+        validate_pool("look.motions", "motion", &look.motions, Motion::from_name)?;
+        validate_interval("look.motion_interval_s", look.motion_interval_s)?;
+        if look.fade_ms > 2_000 {
+            return Err(ConfigError::Invalid {
+                key: "look.fade_ms".to_string(),
+                message: format!("must be 0 to 2000, got {}", look.fade_ms),
+            });
+        }
+        if !look.motion_intensity.is_finite() || !(0.0..=2.0).contains(&look.motion_intensity) {
+            return Err(ConfigError::Invalid {
+                key: "look.motion_intensity".to_string(),
+                message: format!("must be between 0 and 2, got {}", look.motion_intensity),
+            });
+        }
+        if !look.motion_speed.is_finite() || !(0.25..=4.0).contains(&look.motion_speed) {
+            return Err(ConfigError::Invalid {
+                key: "look.motion_speed".to_string(),
+                message: format!("must be between 0.25 and 4, got {}", look.motion_speed),
+            });
+        }
         Ok(())
+    }
+
+    /// The look engine settings, from the file or the defaults.
+    ///
+    /// Assumes [`Config::validate`] has passed; [`Config::load`] validates first.
+    pub fn look_settings(&self) -> LookSettings {
+        let look = &self.look;
+        LookSettings {
+            layout: axis_settings(
+                &look.layout,
+                &look.layouts,
+                look.layout_interval_s,
+                LayoutKind::from_name,
+                || LayoutKind::ALL.to_vec(),
+            ),
+            palette: axis_settings(
+                &look.palette,
+                &look.palettes,
+                look.palette_interval_s,
+                Palette::from_name,
+                || Palette::ALL.to_vec(),
+            ),
+            motion: axis_settings(
+                &look.motion,
+                &look.motions,
+                look.motion_interval_s,
+                Motion::from_name,
+                || {
+                    Motion::ALL
+                        .into_iter()
+                        .filter(|motion| *motion != Motion::None)
+                        .collect()
+                },
+            ),
+            fade_ms: look.fade_ms,
+            motion_intensity: look.motion_intensity,
+            motion_speed: look.motion_speed,
+        }
     }
 
     /// The dynamics settings the renderer needs, from the file or the defaults.
@@ -347,6 +560,19 @@ mod tests {
         assert_eq!(config.analysis.window, 1024);
         assert_eq!(config.port(), None);
         assert_eq!(config.source(), None);
+        assert_eq!(config.look.layout, "snake");
+        assert_eq!(config.look.layouts, Vec::<String>::new());
+        assert_eq!(config.look.layout_interval_s, 0.0);
+        assert_eq!(config.look.palette, "ember");
+        assert_eq!(config.look.palettes, Vec::<String>::new());
+        assert_eq!(config.look.palette_interval_s, 0.0);
+        assert_eq!(config.look.motion, "none");
+        assert_eq!(config.look.motions, Vec::<String>::new());
+        assert_eq!(config.look.motion_interval_s, 0.0);
+        assert_eq!(config.look.fade_ms, 300);
+        assert_eq!(config.look.motion_intensity, 1.0);
+        assert_eq!(config.look.motion_speed, 1.0);
+        assert_eq!(config.look_settings(), LookSettings::default());
     }
 
     #[test]
@@ -377,6 +603,105 @@ beat_threshold = 3.0
     }
 
     #[test]
+    fn the_look_section_maps_to_engine_settings() {
+        let toml = r#"
+[look]
+layout = "random"
+layouts = ["rings", "spiral"]
+layout_interval_s = 12.5
+palette = "ice"
+palettes = ["ember"]
+palette_interval_s = 0.0
+motion = "random"
+motions = []
+motion_interval_s = 8.0
+fade_ms = 0
+motion_intensity = 0.5
+motion_speed = 2.0
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        config.validate().expect("in range");
+        let settings = config.look_settings();
+        assert_eq!(
+            settings.layout,
+            AxisSettings::random(
+                vec![LayoutKind::Rings, LayoutKind::Spiral],
+                Duration::from_secs_f32(12.5)
+            )
+        );
+        assert_eq!(settings.palette, AxisSettings::fixed(Palette::Ice));
+        match settings.motion {
+            AxisSettings::Random { pool, interval } => {
+                assert_eq!(interval, Duration::from_secs(8));
+                assert!(!pool.contains(&Motion::None));
+                assert_eq!(pool.len(), Motion::ALL.len() - 1);
+            }
+            AxisSettings::Fixed(_) => panic!("motion must be random"),
+        }
+        assert_eq!(settings.fade_ms, 0);
+        assert_eq!(settings.motion_intensity, 0.5);
+        assert_eq!(settings.motion_speed, 2.0);
+    }
+
+    #[test]
+    fn a_fixed_axis_ignores_its_pool() {
+        let toml = r#"
+[look]
+layout = "rows"
+layouts = ["rings", "spiral"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        config.validate().expect("in range");
+        assert_eq!(
+            config.look_settings().layout,
+            AxisSettings::fixed(LayoutKind::Rows)
+        );
+    }
+
+    #[test]
+    fn empty_random_pools_use_every_builtin() {
+        let toml = r#"
+[look]
+layout = "random"
+palette = "random"
+motion = "random"
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        config.validate().expect("in range");
+        let settings = config.look_settings();
+        match settings.layout {
+            AxisSettings::Random { pool, .. } => assert_eq!(pool, LayoutKind::ALL.to_vec()),
+            AxisSettings::Fixed(_) => panic!("layout must be random"),
+        }
+        match settings.palette {
+            AxisSettings::Random { pool, .. } => assert_eq!(pool, Palette::ALL.to_vec()),
+            AxisSettings::Fixed(_) => panic!("palette must be random"),
+        }
+        match settings.motion {
+            AxisSettings::Random { pool, .. } => {
+                assert_eq!(pool.len(), Motion::ALL.len() - 1);
+                assert!(!pool.contains(&Motion::None));
+            }
+            AxisSettings::Fixed(_) => panic!("motion must be random"),
+        }
+    }
+
+    #[test]
+    fn an_empty_motion_pool_excludes_none_but_an_explicit_one_allows_it() {
+        let toml = r#"
+[look]
+motion = "random"
+motions = ["none", "sweep"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        config.validate().expect("in range");
+        assert_eq!(
+            config.look_settings().motion,
+            AxisSettings::random(vec![Motion::None, Motion::Sweep], Duration::ZERO)
+        );
+    }
+
+    #[test]
     fn invalid_values_are_rejected_naming_the_key() {
         let cases: &[(&str, &str)] = &[
             ("[render]\nfps_target = 0\n", "render.fps_target"),
@@ -395,6 +720,47 @@ beat_threshold = 3.0
                 "analysis.band_min_hz",
             ),
             ("[render]\nattack = \"slow\"\n", "render.attack"),
+            ("[look]\nlayout = \"wobble\"\n", "look.layout"),
+            ("[look]\nlayout = \"none\"\n", "look.layout"),
+            ("[look]\nlayouts = [\"random\"]\n", "look.layouts"),
+            ("[look]\nlayouts = [\"none\"]\n", "look.layouts"),
+            ("[look]\nlayouts = [\"nope\"]\n", "look.layouts"),
+            ("[look]\nlayouts = [\"rings\", \"rings\"]\n", "look.layouts"),
+            (
+                "[look]\nlayout_interval_s = -1.0\n",
+                "look.layout_interval_s",
+            ),
+            (
+                "[look]\nlayout_interval_s = 86401.0\n",
+                "look.layout_interval_s",
+            ),
+            (
+                "[look]\nlayout_interval_s = nan\n",
+                "look.layout_interval_s",
+            ),
+            ("[look]\npalette = \"rust\"\n", "look.palette"),
+            ("[look]\npalette = \"none\"\n", "look.palette"),
+            ("[look]\npalettes = [\"random\"]\n", "look.palettes"),
+            ("[look]\npalettes = [\"none\"]\n", "look.palettes"),
+            ("[look]\npalettes = [\"ice\", \"ice\"]\n", "look.palettes"),
+            (
+                "[look]\npalette_interval_s = 86401.0\n",
+                "look.palette_interval_s",
+            ),
+            ("[look]\nmotion = \"shimmer\"\n", "look.motion"),
+            ("[look]\nmotions = [\"random\"]\n", "look.motions"),
+            ("[look]\nmotions = [\"sweep\", \"sweep\"]\n", "look.motions"),
+            (
+                "[look]\nmotion_interval_s = -0.1\n",
+                "look.motion_interval_s",
+            ),
+            ("[look]\nfade_ms = 2001\n", "look.fade_ms"),
+            ("[look]\nmotion_intensity = 2.1\n", "look.motion_intensity"),
+            ("[look]\nmotion_intensity = -0.1\n", "look.motion_intensity"),
+            ("[look]\nmotion_intensity = nan\n", "look.motion_intensity"),
+            ("[look]\nmotion_speed = 0.2\n", "look.motion_speed"),
+            ("[look]\nmotion_speed = 4.1\n", "look.motion_speed"),
+            ("[look]\nmotion_speed = nan\n", "look.motion_speed"),
         ];
         for (toml, key) in cases {
             let config: Config = toml::from_str(toml).expect("parses");
@@ -451,6 +817,11 @@ beat_threshold = 3.0
         let config = Config::load(&path).expect("the example config must load");
         assert_eq!(config.render.fps_target, 30);
         assert_eq!(config.analysis.window, 1024);
+        assert_eq!(config.look.layout, "snake");
+        assert_eq!(config.look.palette, "ember");
+        assert_eq!(config.look.motion, "none");
+        assert_eq!(config.look.fade_ms, 300);
+        assert_eq!(config.look_settings(), LookSettings::default());
     }
 
     #[test]

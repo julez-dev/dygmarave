@@ -49,3 +49,38 @@ beat_flash = true
 # How much louder than the rolling average a beat must be to flash. Higher is
 # more selective.
 beat_threshold = 2.0
+
+[look]
+# Three independent axes. Each is a fixed name or "random". Random pools are
+# read only when the matching axis is "random"; an empty pool means every
+# built-in value except "none" for motion.
+layout = "snake"
+layouts = []
+# Seconds between random draws. 0 means draw once at startup and never switch.
+# Every interval is jittered by ±25%, not configurable.
+layout_interval_s = 0.0
+
+palette = "ember"
+palettes = []
+palette_interval_s = 0.0
+
+motion = "none"
+motions = []
+motion_interval_s = 0.0
+
+# Crossfade from the colours actually on screen. 0 cuts immediately.
+fade_ms = 300
+# Motion strength 0..=2 and speed 0.25..=4.
+motion_intensity = 1.0
+motion_speed = 1.0
+
+# Copy-paste "random everything" block: replace the axis keys above with these.
+# layout = "random"
+# layouts = ["snake", "vertical-snake", "rows", "columns", "rings", "diagonal", "spiral", "scatter"]
+# layout_interval_s = 120.0
+# palette = "random"
+# palettes = ["ember", "ice", "magma", "neon", "mono", "spectrum", "solar", "forest"]
+# palette_interval_s = 90.0
+# motion = "random"
+# motions = ["sweep", "sparkle", "breathe", "ripple", "orbit", "rain"]
+# motion_interval_s = 60.0

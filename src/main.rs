@@ -91,6 +91,17 @@ fn run(args: args::Args) -> anyhow::Result<()> {
     if let Some(fps) = args.fps {
         config.render.fps_target = fps;
     }
+    // CLI look flags override the file's axis choice. Pools and intervals stay
+    // config-only; "random" here means "draw from that configured pool".
+    if let Some(layout) = &args.layout {
+        config.look.layout = layout.clone();
+    }
+    if let Some(palette) = &args.palette {
+        config.look.palette = palette.clone();
+    }
+    if let Some(motion) = &args.motion {
+        config.look.motion = motion.clone();
+    }
 
     let interrupted = install_interrupt_handler(if args.probe_audio {
         "stopping"
@@ -99,14 +110,14 @@ fn run(args: args::Args) -> anyhow::Result<()> {
     })
     .context("installing the Ctrl-C handler")?;
 
-    if args.columns || args.rows || args.gradient || args.thumb_pattern {
+    if args.probe_columns || args.probe_rows || args.probe_gradient || args.probe_thumbs {
         return paint_pattern(&args, &config, &interrupted);
     }
     if args.probe_audio {
         return probe_audio(&args, &config, &interrupted);
     }
     if args.live {
-        return live_visualizer(&config, &interrupted);
+        return live_visualizer(&config, &args, &interrupted);
     }
 
     let device = open_device(&config)?;
@@ -216,7 +227,7 @@ fn paint_pattern(
         layout::COLUMNS
     );
 
-    if args.gradient {
+    if args.probe_gradient {
         for half in [layout::Half::Left, layout::Half::Right] {
             let leds = layout::band_leds(half);
             let lowest = leds.first().copied().unwrap_or_default();
@@ -230,14 +241,14 @@ fn paint_pattern(
         println!();
     }
 
-    let colors = if args.gradient {
+    let colors = if args.probe_gradient {
         layout::gradient(count)
-    } else if args.thumb_pattern {
+    } else if args.probe_thumbs {
         println!(
             "\n  guessed thumb clusters — left magenta, right cyan; the dim grey is the rest of the underglow"
         );
         layout::thumb_pattern(count)
-    } else if args.rows {
+    } else if args.probe_rows {
         println!("\n  row   colour (r,g,b)");
         for row in 0..layout::ROWS {
             println!("  {row}     {}", layout::row_colour(row));
@@ -263,9 +274,9 @@ fn paint_pattern(
     session.write_frame(&Frame::from_colors(&colors))?;
     println!(
         "\n{}",
-        if args.gradient {
+        if args.probe_gradient {
             "Red = lowest band at the inner edge, blue = highest at the outer edges."
-        } else if args.thumb_pattern {
+        } else if args.probe_thumbs {
             "Take a photograph: the magenta and cyan LEDs are where the thumbs are guessed to be.\n  If they are in the wrong place, the indices in layout.rs need correcting."
         } else {
             "Every key in one group shares a colour; underglow and thumbs stay dark."
@@ -773,6 +784,11 @@ fn run_frames<L: Link>(
     Ok((Detach::Interrupted, acks))
 }
 
+/// The one startup line that makes a random rotation reproducible.
+fn seed_line(seed: u64) -> String {
+    format!("seed={seed}")
+}
+
 /// Runs the visualizer until interrupted: audio in, frames out, steady pace.
 ///
 /// The audio source is resolved *before* the board is touched, so a failed
@@ -781,7 +797,19 @@ fn run_frames<L: Link>(
 /// The board comes and goes: Bazecor may take the port, or the board may be
 /// unplugged. The audio pipeline stays up throughout; the outer loop waits and
 /// reopens the board when it is available again.
-fn live_visualizer(config: &config::Config, interrupted: &AtomicBool) -> anyhow::Result<()> {
+fn live_visualizer(
+    config: &config::Config,
+    args: &args::Args,
+    interrupted: &AtomicBool,
+) -> anyhow::Result<()> {
+    // Without --seed, fastrand draws fresh OS entropy. Log the effective seed once
+    // so a surprising random rotation can be reproduced.
+    let seed = args.seed.unwrap_or_else(|| fastrand::u64(..));
+    if !args.quiet {
+        eprintln!("{}", seed_line(seed));
+    }
+    let look_settings = config.look_settings();
+
     let selection = audio::choose(config.source()).context("choosing an audio source")?;
     println!("source: {selection}");
 
@@ -851,9 +879,12 @@ fn live_visualizer(config: &config::Config, interrupted: &AtomicBool) -> anyhow:
         };
 
         let count = session.led_count();
-        let mut visualizer = live::Live::with_dynamics(
+        let mut visualizer = live::Live::with_look(
             live_config,
             config.dynamics(),
+            look_settings.clone(),
+            seed,
+            args.quiet,
             plan.clone(),
             count,
             Instant::now(),
@@ -952,6 +983,12 @@ fn install_interrupt_handler(what: &'static str) -> anyhow::Result<Arc<AtomicBoo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_seed_line_is_stable() {
+        assert_eq!(seed_line(42), "seed=42");
+        assert_eq!(seed_line(u64::MAX), "seed=18446744073709551615");
+    }
 
     #[test]
     fn backoff_doubles_up_to_the_cap() {

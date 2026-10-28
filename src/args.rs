@@ -9,18 +9,24 @@ use std::ffi::OsString;
 
 use clap::Parser;
 
+use crate::layout::LayoutKind;
+use crate::motion::Motion;
+use crate::palette::Palette;
 use crate::theme::Rgb;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "dygmarave",
     version,
-    about = "Prove the LED path and measure the frame budget",
+    about = "Audio-reactive per-key LEDs for the Dygma Raise",
     after_help = "With --probe-audio, the default sink's monitor is captured (never the \
 microphone) and a live level meter is printed, failing if no signal arrives. \
 --probe-spectrum replaces the meter with one character per frequency band. \
 --live drives the board from the output mix until Ctrl-C: a moving spectrum, \
 band energies through the colour ramp, instant attack and slow decay.\n\n\
+--layout, --palette and --motion choose a fixed look axis or \"random\"; random \
+pools and intervals come from [look] in the config file. --seed makes the random \
+draws reproducible and --quiet suppresses the seed and switch log.\n\n\
 The board is found by USB identity, not by a fixed port name. The LED count is \
 read from the board itself. The baseline theme and LED mode are restored on exit \
 and when Ctrl-C is pressed once; pressing Ctrl-C a second time aborts without \
@@ -47,21 +53,21 @@ pub struct Args {
     #[arg(long = "probe-audio", conflicts_with = "live")]
     pub probe_audio: bool,
 
-    /// paint each physical column a different colour
-    #[arg(long)]
-    pub columns: bool,
+    /// static hardware probe: paint each physical column a different colour (not a live layout)
+    #[arg(long = "probe-columns", alias = "columns")]
+    pub probe_columns: bool,
 
-    /// paint each physical row a different colour
-    #[arg(long)]
-    pub rows: bool,
+    /// static hardware probe: paint each physical row a different colour (not a live layout)
+    #[arg(long = "probe-rows", alias = "rows")]
+    pub probe_rows: bool,
 
-    /// paint the band sequence as a hue ramp
-    #[arg(long)]
-    pub gradient: bool,
+    /// static hardware probe: paint the snake band sequence as a hue ramp (not a live layout)
+    #[arg(long = "probe-gradient", alias = "gradient")]
+    pub probe_gradient: bool,
 
-    /// light the guessed thumb clusters so a photograph can confirm them
-    #[arg(long = "thumbs", visible_alias = "thumb-pattern")]
-    pub thumb_pattern: bool,
+    /// static hardware probe: light the guessed thumb clusters (not a live layout)
+    #[arg(long = "probe-thumbs", alias = "thumbs", alias = "thumb-pattern")]
+    pub probe_thumbs: bool,
 
     /// probe audio and print 28 log-spaced band energies
     #[arg(long = "probe-spectrum", conflicts_with = "live")]
@@ -70,6 +76,26 @@ pub struct Args {
     /// drive the board live from whatever the speakers are playing
     #[arg(long)]
     pub live: bool,
+
+    /// fixed layout name, or "random" (pools and intervals come from [look])
+    #[arg(long, value_parser = parse_layout_choice)]
+    pub layout: Option<String>,
+
+    /// fixed palette name, or "random"
+    #[arg(long, value_parser = parse_palette_choice)]
+    pub palette: Option<String>,
+
+    /// fixed motion name, or "random"
+    #[arg(long, value_parser = parse_motion_choice)]
+    pub motion: Option<String>,
+
+    /// seed for random draws; omit to use OS entropy
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// suppress the startup seed line and per-switch lines
+    #[arg(long)]
+    pub quiet: bool,
 
     /// frames per second for --live (default 30; lowered automatically when the
     /// board cannot keep up)
@@ -100,6 +126,34 @@ where
         parsed.probe_audio = true;
     }
     Ok(parsed)
+}
+
+fn parse_layout_choice(value: &str) -> Result<String, String> {
+    parse_axis_choice(value, "layout", |name| {
+        LayoutKind::from_name(name).is_some()
+    })
+}
+
+fn parse_palette_choice(value: &str) -> Result<String, String> {
+    parse_axis_choice(value, "palette", |name| Palette::from_name(name).is_some())
+}
+
+fn parse_motion_choice(value: &str) -> Result<String, String> {
+    parse_axis_choice(value, "motion", |name| Motion::from_name(name).is_some())
+}
+
+fn parse_axis_choice(
+    value: &str,
+    what: &str,
+    known: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    if value == "random" || known(value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "unknown {what} {value:?}; expected a built-in name or \"random\""
+        ))
+    }
 }
 
 /// Accepts `R,G,B`.
@@ -153,12 +207,17 @@ mod tests {
         assert_eq!(parsed.hold_ms, 3_000);
         assert_eq!(parsed.frames, 120);
         assert!(!parsed.probe_audio);
-        assert!(!parsed.columns);
-        assert!(!parsed.rows);
-        assert!(!parsed.gradient);
-        assert!(!parsed.thumb_pattern);
+        assert!(!parsed.probe_columns);
+        assert!(!parsed.probe_rows);
+        assert!(!parsed.probe_gradient);
+        assert!(!parsed.probe_thumbs);
         assert!(!parsed.probe_spectrum);
         assert!(!parsed.live);
+        assert_eq!(parsed.layout, None);
+        assert_eq!(parsed.palette, None);
+        assert_eq!(parsed.motion, None);
+        assert_eq!(parsed.seed, None);
+        assert!(!parsed.quiet);
         assert_eq!(parsed.fps, None);
         assert_eq!(parsed.seconds, 5);
         assert_eq!(parsed.source, None);
@@ -193,6 +252,56 @@ mod tests {
             None,
             "None means use the config file's target"
         );
+    }
+
+    #[test]
+    fn parses_the_look_axis_flags_seed_and_quiet() {
+        let parsed = args(&[
+            "--layout",
+            "rings",
+            "--palette",
+            "ice",
+            "--motion",
+            "sweep",
+            "--seed",
+            "42",
+            "--quiet",
+        ])
+        .unwrap();
+        assert_eq!(parsed.layout.as_deref(), Some("rings"));
+        assert_eq!(parsed.palette.as_deref(), Some("ice"));
+        assert_eq!(parsed.motion.as_deref(), Some("sweep"));
+        assert_eq!(parsed.seed, Some(42));
+        assert!(parsed.quiet);
+
+        for flag in ["--layout", "--palette", "--motion"] {
+            let parsed = args(&[flag, "random"]).unwrap();
+            match flag {
+                "--layout" => assert_eq!(parsed.layout.as_deref(), Some("random")),
+                "--palette" => assert_eq!(parsed.palette.as_deref(), Some("random")),
+                _ => assert_eq!(parsed.motion.as_deref(), Some("random")),
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_look_axis_names_exit_two() {
+        for (flag, value) in [
+            ("--layout", "wobble"),
+            ("--palette", "rust"),
+            ("--motion", "shimmer"),
+            ("--layout", "none"),
+            ("--palette", "random-please"),
+        ] {
+            let error = args(&[flag, value]).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{flag} {value} must be a usage error");
+            assert!(error.to_string().contains("unknown"));
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_seed_is_rejected() {
+        assert!(args(&["--seed", "later"]).is_err());
     }
 
     #[test]
@@ -246,12 +355,17 @@ mod tests {
 
     #[test]
     fn the_pattern_flags_are_independent_of_the_audio_probes() {
-        let parsed = args(&["--columns"]).unwrap();
-        assert!(parsed.columns);
+        let parsed = args(&["--probe-columns"]).unwrap();
+        assert!(parsed.probe_columns);
         assert!(!parsed.probe_audio);
-        assert!(args(&["--rows"]).unwrap().rows);
-        assert!(args(&["--thumbs"]).unwrap().thumb_pattern);
-        assert!(args(&["--thumb-pattern"]).unwrap().thumb_pattern);
+        assert!(args(&["--columns"]).unwrap().probe_columns);
+        assert!(args(&["--probe-rows"]).unwrap().probe_rows);
+        assert!(args(&["--rows"]).unwrap().probe_rows);
+        assert!(args(&["--probe-gradient"]).unwrap().probe_gradient);
+        assert!(args(&["--gradient"]).unwrap().probe_gradient);
+        assert!(args(&["--probe-thumbs"]).unwrap().probe_thumbs);
+        assert!(args(&["--thumbs"]).unwrap().probe_thumbs);
+        assert!(args(&["--thumb-pattern"]).unwrap().probe_thumbs);
     }
 
     #[test]
@@ -289,6 +403,16 @@ mod tests {
             );
             assert_eq!(error.exit_code(), 2, "usage errors exit 2");
         }
+    }
+
+    #[test]
+    fn help_calls_the_probe_flags_static_hardware_probes() {
+        let help = args(&["--help"]).unwrap_err().to_string();
+        assert!(help.contains("static hardware probe"));
+        assert!(help.contains("--probe-columns"));
+        assert!(help.contains("--probe-thumbs"));
+        assert!(help.contains("--seed"));
+        assert!(help.contains("--quiet"));
     }
 
     #[test]
