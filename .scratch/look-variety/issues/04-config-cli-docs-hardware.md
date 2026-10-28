@@ -7,7 +7,7 @@ draws, and quiet the switch log.
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## Acceptance criteria
 
@@ -52,8 +52,9 @@ draws, and quiet the switch log.
 
 ## Hardware
 
-**Pending controller/user verification. Nothing below has been run by the
-implementer; no visual or hardware claim is made here.**
+**Verified with the user on 2026-10-28, release build, wired ANSI Raise
+(`/dev/ttyACM0`), music playing on the default sink. The implementer did not run
+hardware; the controller and user did.**
 
 Run these only with the user present and audio playing where a lit board is
 needed. `timeout -s INT` sends Ctrl-C so the restore path runs.
@@ -112,6 +113,30 @@ XDG_CONFIG_HOME=/tmp/dygmarave-hardware timeout -s INT 600s cargo run --release 
 Photograph `rings` and `spiral` during their live runs. Observe flicker beyond the
 accepted layer-change blink, typing latency, thumb level/flash behaviour, and
 restoration after each Ctrl-C.
+
+## Hardware results
+
+- **Static probes (5 s holds):** `--probe-columns`, `--probe-rows`,
+  `--probe-gradient`, and `--probe-thumbs` all looked correct. Groups shared
+  colours, halves mirrored, bass sat at the inner edge, and the thumb guesses
+  were in the right place. Each run restored LED mode 0.
+- **Individually observed live looks:** `rings` (ice), `spiral` (magma),
+  `snake` (ice), `snake` (spectrum), `sparkle`, and `ripple` all looked correct
+  and distinct.
+- **Random rotation (2 minutes, intervals 5/7/6 s, seed 7):** 60 logged switches,
+  3599 frames, 30.0 fps achieved against the 30 fps target, 0 pacing resyncs,
+  0 blocks discarded, clean crossfades, typing responsive, thumb level + white
+  beat flash correct, and a clean restore to baseline on SIGINT. The rotation
+  exercised all eight layouts, all eight palettes, and all seven motions,
+  including `sweep`, `sweep-vertical`, `breathe`, `orbit`, and `rain`.
+- **Not run:** the full 10-minute soak and individual 20 s runs for every
+  axis value; the user chose the short guided pass. The 2-minute rotation is the
+  integration evidence, not a substitute for a long soak.
+
+**Incident:** the ticket-04 reviewer accidentally started a 5-minute `--live`
+run during validation and was killed by a command timeout. The process was gone,
+the serial port was free, and the user confirmed the keyboard looked normal
+before the real pass. No repeated hardware runs were made by an agent.
 
 ## Comments
 
