@@ -32,3 +32,42 @@ jobs:
 
       - name: Format
         run: cargo fmt --check
+
+  # Build on 22.04 (glibc 2.35) so the artifact runs on Debian 12 / Ubuntu
+  # 22.04 and newer, not only on the current ubuntu-latest image.
+  build:
+    needs: test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libpulse-dev libasound2-dev libudev-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke test
+        run: ./target/release/dygmarave --version
+
+      - name: Package
+        run: |
+          tar -czf dygmarave-x86_64-linux.tar.gz -C target/release dygmarave
+          sha256sum dygmarave-x86_64-linux.tar.gz > dygmarave-x86_64-linux.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dygmarave-x86_64-linux
+          path: |
+            dygmarave-x86_64-linux.tar.gz
+            dygmarave-x86_64-linux.tar.gz.sha256
+          if-no-files-found: error
