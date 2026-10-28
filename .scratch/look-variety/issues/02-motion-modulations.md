@@ -61,8 +61,9 @@ Implemented on branch `look-variety`; ticket 03 is untouched.
   clock, glint/ripple ageing, beat edge detection (`Dynamics::beat_count`) and
   spawn decisions. `modulate` is pure over `&self`. `reset_events` clears
   glints/ripples and re-draws rain from the continuing RNG, but never touches
-  `elapsed`. The next advance after a reset only snapshots the beat counter, so a
-  beat from before the switch cannot fire late.
+  `elapsed`. A live switch uses `reset_events_at(dynamics)`, which also snapshots
+  the current beat counters; a beat after the switch and before that frame's
+  advance still fires, while a beat from before the switch cannot fire late.
 - **Fixed buffers.** 16 glint slots and 2 ripple slots per half, 4 rain droplets
   per half, all fixed-size arrays. No motion-path allocation; `advance` and
   `modulate` only do arithmetic.
@@ -84,7 +85,7 @@ Implemented on branch `look-variety`; ticket 03 is untouched.
   `motion.advance(now, &dynamics)` once per frame in `step`, then composes. Ticket
   03 can replace the acquisition of `now` without moving state.
 
-Validation run locally: `cargo test` (225 tests), `cargo clippy --all-targets --
+Validation run locally: `cargo test` (227 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.
 
 ## Review fixes (ticket 02)
@@ -93,10 +94,25 @@ Validation run locally: `cargo test` (225 tests), `cargo clippy --all-targets --
   existing rising edge. `is_flashing` remains the thumb flash only. `MotionState`
   tracks the last seen count per half and spawns once per missed count, so two
   beats inside one flash window spawn twice and a 0.2 s frame cannot miss a beat.
-- Reset/motion change leaves the seen count empty; the next advance snapshots it
-  without firing. The following beat spawns normally.
+- `reset_events()` remains the construction/startup path and deliberately
+  suppresses the first beat until an advance. Live switches use
+  `reset_events_at(&Dynamics)` (or `set_motion_at`/`set_settings_at`), which clears
+  events and snapshots the current counters immediately. A beat that arrives after
+  the switch but before the frame's advance is therefore not swallowed.
 - Ripple lifetime is fixed at 600 ms; sweep/orbit/rain remain speed-scaled.
 - Resets no longer re-seed the RNG: rain and sparkle patterns continue from the
   live stream. Two identical seeds still reproduce the same reset sequence.
 - Geometry helpers are `pub(crate)`, `modulate` takes a `Half`, and ripple also
   early-returns at zero intensity.
+
+## Reset ordering fix (ticket 02 review)
+
+- Added `MotionState::reset_events_at(&Dynamics)`, `set_motion_at` and
+  `set_settings_at`. They clear event state and snapshot `Dynamics::beat_count`
+  at the switch, so the switch path has no window where a real post-switch beat
+  is lost. `reset_events()` stays for construction/startup and documents that it
+  suppresses the first beat until the next advance.
+- Tests pin the exact order beat → advance → `reset_events_at` → beat (no
+  intermediate advance) → advance, and prove a pre-switch beat cannot fire late.
+  The overlapping-beats test now uses 10 ms dynamics steps and asserts the flash
+  is still active after each beat, so it fails if gating reverts to flash edges.

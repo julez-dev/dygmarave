@@ -35,9 +35,10 @@ it owns the fade state so `render::compose` stays pure.
 - [ ] `fade_ms = 0` cuts immediately. Fade alpha is wall-clock based, monotonic,
       and reaches the target exactly at the deadline. A smoothstep curve is fine;
       linear is acceptable if documented.
-- [ ] On selecting a different motion, call `MotionState::set_settings`/
-      `reset_events`, which clears pending `sparkle`/`ripple`/`rain` events while
-      periodic motion phase stays continuous.
+- [ ] On selecting a different motion, call `MotionState::set_settings_at`/
+      `set_motion_at` (or `reset_events_at`) with the current `Dynamics` **before**
+      this frame's `motion.advance`. That clears pending `sparkle`/`ripple`/`rain`
+      events, snapshots the beat counters, and leaves periodic phase continuous.
 - [ ] `MotionState` is the active motion selection plus runtime: the engine keeps
       the current `Motion`/`MotionSettings` for scheduling and logging, passes the
       state explicitly to `render::compose` alongside `Look`, and advances it once
@@ -60,6 +61,11 @@ it owns the fade state so `render::compose` stays pure.
 - `render::compose(dynamics, count, look, &motion)` already takes `MotionState`
   explicitly. Reuse one state per engine, not a new state per frame; the engine
   owns motion scheduling/logging and calls `advance` exactly once per frame.
+- Switch ordering matters: call `reset_events_at(&dynamics)` (or the `_at`
+  settings/motion variant) when the switch is applied, then call
+  `motion.advance(now, &dynamics)` once for the frame. Do not call plain
+  `reset_events()` on a live switch; it is the construction/startup path and
+  suppresses a beat until the next advance.
 - Suggested shape: `LookState::new(settings, seed, now) -> LookState`,
   `LookState::tick(now) -> Option<Switch>`, `LookState::selection() -> Selection`,
   `LookState::fade_alpha(now) -> f32`,

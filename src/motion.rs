@@ -269,6 +269,18 @@ impl MotionState {
         }
     }
 
+    /// [`MotionState::set_settings`] for a live switch: snapshots the current beat
+    /// counts so a beat after the switch but before the next advance still fires.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_settings_at(&mut self, settings: MotionSettings, dynamics: &Dynamics) {
+        let settings = settings.normalised();
+        let motion_changed = settings.motion != self.settings.motion;
+        self.settings = settings;
+        if motion_changed {
+            self.reset_events_at(dynamics);
+        }
+    }
+
     /// Switches motion, clearing event state when the motion actually changes.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_motion(&mut self, motion: Motion) {
@@ -278,17 +290,46 @@ impl MotionState {
         }
     }
 
-    /// Clears sparkle, ripple and rain event state, leaving the clock untouched.
+    /// [`MotionState::set_motion`] for a live switch. See
+    /// [`MotionState::reset_events_at`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_motion_at(&mut self, motion: Motion, dynamics: &Dynamics) {
+        if motion != self.settings.motion {
+            self.settings.motion = motion;
+            self.reset_events_at(dynamics);
+        }
+    }
+
+    /// Clears event state for construction/startup, leaving the clock untouched.
     ///
-    /// The next advance only snapshots the beat counters, so a beat that happened
-    /// before the switch cannot fire late. Rain is re-drawn from the continuing
-    /// RNG, so repeated switches do not replay one frozen pattern.
+    /// This deliberately suppresses a beat until the next advance snapshots the
+    /// counters. A beat that happens after this call but before that advance is
+    /// lost. Switch paths must use [`MotionState::reset_events_at`] instead.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset_events(&mut self) {
+        self.clear_events();
         self.seen_beats = [None; HALVES];
+    }
+
+    /// Clears event state for a live switch and snapshots the current beat counts.
+    ///
+    /// Call this with the same `Dynamics` the frame will use, before that frame's
+    /// [`MotionState::advance`]. Only beats the counters gain *after* this call
+    /// spawn events; beats already present cannot fire late.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reset_events_at(&mut self, dynamics: &Dynamics) {
+        self.clear_events();
+        for half in 0..HALVES {
+            self.seen_beats[half] = Some(dynamics.beat_count(channel_for_half(dynamics, half)));
+        }
+    }
+
+    fn clear_events(&mut self) {
         self.glints = [[Glint::default(); SPARKLE_SLOTS]; HALVES];
         self.next_glint = [0; HALVES];
         self.ripples = [[Ripple::default(); RIPPLE_SLOTS]; HALVES];
+        // Rain is redrawn from the continuing RNG, so repeated switches do not
+        // replay one frozen pattern.
         for half in 0..HALVES {
             let rain = Rain::draw(&mut self.rng, self.elapsed);
             self.rain[half] = rain;
@@ -316,8 +357,9 @@ impl MotionState {
             let previous = self.seen_beats[half];
             self.seen_beats[half] = Some(count);
 
-            // A reset leaves `previous` as None: snapshot the counter without
-            // firing, so only beats after the switch can spawn events.
+            // Construction/startup leaves `previous` as None: snapshot the
+            // counter without firing. A live switch uses `reset_events_at` and
+            // supplies a real snapshot instead.
             let Some(previous) = previous else {
                 continue;
             };
@@ -1014,16 +1056,22 @@ mod tests {
         let mut state = MotionState::new(settings(Motion::Ripple, 1.0, 1.0), 22);
         state.advance(start, &dynamics);
 
-        // Two beat cycles inside one flash window. The first beat leaves the
-        // flash true, so only a counter can see the second one.
-        for _ in 0..2 {
-            dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.05);
-            dynamics.update(&beat_spectrum(), 0.05);
+        // Two beat cycles inside one flash window. Ten-millisecond steps keep the
+        // first flash alive across the second beat, so this fails if event gating
+        // ever goes back to watching `is_flashing` edges.
+        for beat in 0..2 {
+            dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.01);
+            dynamics.update(&beat_spectrum(), 0.01);
+            assert_eq!(dynamics.beat_count(0), beat + 1);
+            assert!(
+                dynamics.is_flashing(0),
+                "beat {} must still be inside the flash window",
+                beat + 1
+            );
         }
         assert_eq!(dynamics.beat_count(0), 2);
-        assert!(dynamics.is_flashing(0), "both beats are inside one flash");
 
-        state.advance(start + Duration::from_millis(200), &dynamics);
+        state.advance(start + Duration::from_millis(100), &dynamics);
         assert_eq!(
             active_ripples(&state, 0),
             2,
@@ -1041,10 +1089,11 @@ mod tests {
         state.advance(start + Duration::from_millis(50), &dynamics);
         assert!(active_glints(&state, 0) > 0);
 
-        state.reset_events();
+        state.reset_events_at(&dynamics);
         assert_eq!(active_glints(&state, 0), 0);
 
-        // This advance only snapshots the count that was already there.
+        // The count was snapshotted at reset, so the beat that was already there
+        // cannot fire late on the next advance.
         state.advance(start + Duration::from_millis(100), &dynamics);
         assert_eq!(
             active_glints(&state, 0),
@@ -1052,13 +1101,73 @@ mod tests {
             "a beat from before the switch must not fire late"
         );
 
-        // The next real beat after the sync does fire.
+        // The next real beat after the switch does fire.
         dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.05);
         dynamics.update(&beat_spectrum(), 0.05);
         state.advance(start + Duration::from_millis(150), &dynamics);
         assert!(
             active_glints(&state, 0) > 0,
             "the next beat after reset must spawn"
+        );
+    }
+
+    #[test]
+    fn a_beat_after_reset_at_and_before_advance_still_spawns() {
+        // Exact switch order: beat -> advance -> reset_events_at -> beat -> advance.
+        // There is deliberately no intermediate advance between the reset and the
+        // post-switch beat.
+        let start = Instant::now();
+        let mut dynamics = quiet_dynamics();
+        let mut state = MotionState::new(settings(Motion::Sparkle, 2.0, 1.0), 23);
+        state.advance(start, &dynamics);
+
+        dynamics.update(&beat_spectrum(), 0.01);
+        assert_eq!(dynamics.beat_count(0), 1);
+        state.advance(start + Duration::from_millis(10), &dynamics);
+        assert!(active_glints(&state, 0) > 0);
+
+        state.reset_events_at(&dynamics);
+        assert_eq!(active_glints(&state, 0), 0);
+
+        // No advance here: the beat lands after the reset but before the frame.
+        dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.01);
+        dynamics.update(&beat_spectrum(), 0.01);
+        assert_eq!(dynamics.beat_count(0), 2);
+        state.advance(start + Duration::from_millis(20), &dynamics);
+        assert!(
+            active_glints(&state, 0) > 0,
+            "a beat after reset_events_at must not be swallowed by the next advance"
+        );
+    }
+
+    #[test]
+    fn motion_switch_at_snapshots_the_beat_count() {
+        let start = Instant::now();
+        let mut dynamics = quiet_dynamics();
+        let mut state = MotionState::new(settings(Motion::Sparkle, 1.0, 1.0), 26);
+        state.advance(start, &dynamics);
+        dynamics.update(&beat_spectrum(), 0.01); // count 1
+        state.advance(start + Duration::from_millis(10), &dynamics);
+
+        // Switch to ripple without an intermediate advance, then beat.
+        state.set_motion_at(Motion::Ripple, &dynamics);
+        dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.01);
+        dynamics.update(&beat_spectrum(), 0.01); // count 2
+        state.advance(start + Duration::from_millis(20), &dynamics);
+        assert_eq!(
+            active_ripples(&state, 0),
+            1,
+            "a switch to ripple must not swallow the next beat"
+        );
+
+        // And the same through the settings variant, switching back to sparkle.
+        state.set_settings_at(settings(Motion::Sparkle, 1.0, 1.0), &dynamics);
+        dynamics.update(&spectrum_with(&[0.0; BAND_COUNT]), 0.01);
+        dynamics.update(&beat_spectrum(), 0.01); // count 3
+        state.advance(start + Duration::from_millis(30), &dynamics);
+        assert!(
+            active_glints(&state, 0) > 0,
+            "set_settings_at must snapshot for the next beat too"
         );
     }
 
