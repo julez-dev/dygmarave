@@ -51,9 +51,10 @@ beat_flash = true
 beat_threshold = 2.0
 
 [look]
-# Three independent axes. Each is a fixed name or "random". Random pools are
-# read only when the matching axis is "random"; an empty pool means every
-# built-in value except "none" for motion.
+# Three independent axes. Each is a fixed name or "random". Pools are validated
+# whenever present, even while the axis is fixed; they are used only when the
+# matching axis is "random". An empty pool means every built-in value except
+# "none" for motion.
 layout = "snake"
 layouts = []
 # Seconds between random draws. 0 means draw once at startup and never switch.

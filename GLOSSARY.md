@@ -63,7 +63,7 @@ An additive modulation over the composed matrix, such as a sweep or sparkle. Mot
 _Avoid_: Effect, animation
 
 **Switch**:
-A change of one look axis, either a timer draw from a random pool or a fixed selection taking effect.
+A logged change of one look axis made by a random timer. A fixed selection resolved once at startup is not a switch.
 _Avoid_: Transition, update
 
 ### Render

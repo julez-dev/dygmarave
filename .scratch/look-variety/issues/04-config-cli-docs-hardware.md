@@ -135,5 +135,21 @@ Implemented on branch `look-variety`; no hardware commands were run.
 - Docs added: ADR-0005, README, glossary Layout/Palette/Motion/Switch plus
   amended Band sequence/Ramp. Hardware verification is pending above.
 
-Validation run locally: `cargo test` (259 tests), `cargo clippy --all-targets --
+Validation run locally: `cargo test` (262 tests), `cargo clippy --all-targets --
 -D warnings`, `cargo fmt --check`.
+
+## Review hardening
+
+- Seed and switch logs are testable seams: `main::seed_line(seed, quiet, live)`
+  and `live::switch_lines(&switches, quiet)`. Tests cover zero/one/many switches,
+  same-tick lines, quiet suppression, probe runs emitting no seed line, and the
+  exact `layout snake -> rows (random)` format.
+- `look.fade_ms` deserialises as an integer-or-float number, validates as a whole
+  number in 0..=2000, and only then converts to `u32`. Negative and fractional
+  values now fail naming `look.fade_ms`.
+- `Live::with_look` takes a `LiveOptions` parameter object; the positional
+  eight-argument constructor and its clippy allow are gone. `Live::new` remains
+  the defaulting wrapper.
+- `Config::look_settings` is `pub(crate)` and keeps the validated-input
+  invariant. A fixed axis with an invalid unused pool still fails on
+  `look.layouts`.

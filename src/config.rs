@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::dynamics::DynamicsConfig;
 use crate::layout::LayoutKind;
@@ -162,7 +162,12 @@ pub struct LookConfig {
     /// Seconds between random motion draws.
     pub motion_interval_s: f32,
     /// Crossfade duration in milliseconds. 0 cuts immediately.
-    pub fade_ms: u32,
+    ///
+    /// Parsed as a number so a negative or fractional value reaches validation and
+    /// the error can name `look.fade_ms`; it is converted to milliseconds for the
+    /// engine only after validation.
+    #[serde(deserialize_with = "deserialize_fade_ms")]
+    pub fade_ms: f64,
     /// Multiplier for the active motion's strength, 0..=2.
     pub motion_intensity: f32,
     /// Multiplier for the active motion's speed, 0.25..=4.
@@ -181,10 +186,27 @@ impl Default for LookConfig {
             motion: "none".to_string(),
             motions: Vec::new(),
             motion_interval_s: 0.0,
-            fade_ms: 300,
+            fade_ms: 300.0,
             motion_intensity: 1.0,
             motion_speed: 1.0,
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FadeMilliseconds {
+    Integer(i64),
+    Float(f64),
+}
+
+fn deserialize_fade_ms<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match FadeMilliseconds::deserialize(deserializer)? {
+        FadeMilliseconds::Integer(value) => Ok(value as f64),
+        FadeMilliseconds::Float(value) => Ok(value),
     }
 }
 
@@ -448,10 +470,16 @@ impl Config {
         validate_axis_choice("look.motion", "motion", &look.motion, Motion::from_name)?;
         validate_pool("look.motions", "motion", &look.motions, Motion::from_name)?;
         validate_interval("look.motion_interval_s", look.motion_interval_s)?;
-        if look.fade_ms > 2_000 {
+        if !look.fade_ms.is_finite()
+            || !(0.0..=2_000.0).contains(&look.fade_ms)
+            || look.fade_ms.fract() != 0.0
+        {
             return Err(ConfigError::Invalid {
                 key: "look.fade_ms".to_string(),
-                message: format!("must be 0 to 2000, got {}", look.fade_ms),
+                message: format!(
+                    "must be a whole number of milliseconds from 0 to 2000, got {}",
+                    look.fade_ms
+                ),
             });
         }
         if !look.motion_intensity.is_finite() || !(0.0..=2.0).contains(&look.motion_intensity) {
@@ -472,7 +500,7 @@ impl Config {
     /// The look engine settings, from the file or the defaults.
     ///
     /// Assumes [`Config::validate`] has passed; [`Config::load`] validates first.
-    pub fn look_settings(&self) -> LookSettings {
+    pub(crate) fn look_settings(&self) -> LookSettings {
         let look = &self.look;
         LookSettings {
             layout: axis_settings(
@@ -501,7 +529,7 @@ impl Config {
                         .collect()
                 },
             ),
-            fade_ms: look.fade_ms,
+            fade_ms: look.fade_ms as u32,
             motion_intensity: look.motion_intensity,
             motion_speed: look.motion_speed,
         }
@@ -569,7 +597,7 @@ mod tests {
         assert_eq!(config.look.motion, "none");
         assert_eq!(config.look.motions, Vec::<String>::new());
         assert_eq!(config.look.motion_interval_s, 0.0);
-        assert_eq!(config.look.fade_ms, 300);
+        assert_eq!(config.look.fade_ms, 300.0);
         assert_eq!(config.look.motion_intensity, 1.0);
         assert_eq!(config.look.motion_speed, 1.0);
         assert_eq!(config.look_settings(), LookSettings::default());
@@ -656,6 +684,18 @@ layouts = ["rings", "spiral"]
             config.look_settings().layout,
             AxisSettings::fixed(LayoutKind::Rows)
         );
+    }
+
+    #[test]
+    fn a_fixed_axis_with_an_invalid_unused_pool_still_fails() {
+        let toml = r#"
+[look]
+layout = "snake"
+layouts = ["rings", "not-a-layout"]
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        let error = config.validate().expect_err("the pool is still validated");
+        assert!(error.to_string().contains("look.layouts"), "{error}");
     }
 
     #[test]
@@ -755,6 +795,8 @@ motions = ["none", "sweep"]
                 "look.motion_interval_s",
             ),
             ("[look]\nfade_ms = 2001\n", "look.fade_ms"),
+            ("[look]\nfade_ms = -1.0\n", "look.fade_ms"),
+            ("[look]\nfade_ms = 300.5\n", "look.fade_ms"),
             ("[look]\nmotion_intensity = 2.1\n", "look.motion_intensity"),
             ("[look]\nmotion_intensity = -0.1\n", "look.motion_intensity"),
             ("[look]\nmotion_intensity = nan\n", "look.motion_intensity"),
@@ -820,7 +862,7 @@ motions = ["none", "sweep"]
         assert_eq!(config.look.layout, "snake");
         assert_eq!(config.look.palette, "ember");
         assert_eq!(config.look.motion, "none");
-        assert_eq!(config.look.fade_ms, 300);
+        assert_eq!(config.look.fade_ms, 300.0);
         assert_eq!(config.look_settings(), LookSettings::default());
     }
 

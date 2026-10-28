@@ -785,8 +785,11 @@ fn run_frames<L: Link>(
 }
 
 /// The one startup line that makes a random rotation reproducible.
-fn seed_line(seed: u64) -> String {
-    format!("seed={seed}")
+///
+/// Only live runs emit it: the static probes never consume the look seed. It is
+/// also suppressed by `--quiet`.
+fn seed_line(seed: u64, quiet: bool, live: bool) -> Option<String> {
+    (live && !quiet).then(|| format!("seed={seed}"))
 }
 
 /// Runs the visualizer until interrupted: audio in, frames out, steady pace.
@@ -805,8 +808,8 @@ fn live_visualizer(
     // Without --seed, fastrand draws fresh OS entropy. Log the effective seed once
     // so a surprising random rotation can be reproduced.
     let seed = args.seed.unwrap_or_else(|| fastrand::u64(..));
-    if !args.quiet {
-        eprintln!("{}", seed_line(seed));
+    if let Some(line) = seed_line(seed, args.quiet, true) {
+        eprintln!("{line}");
     }
     let look_settings = config.look_settings();
 
@@ -879,16 +882,16 @@ fn live_visualizer(
         };
 
         let count = session.led_count();
-        let mut visualizer = live::Live::with_look(
-            live_config,
-            config.dynamics(),
-            look_settings.clone(),
+        let mut visualizer = live::Live::with_look(live::LiveOptions {
+            config: live_config,
+            dynamics: config.dynamics(),
+            look: look_settings.clone(),
             seed,
-            args.quiet,
-            plan.clone(),
+            quiet: args.quiet,
+            plan: plan.clone(),
             count,
-            Instant::now(),
-        );
+            start: Instant::now(),
+        });
         println!(
             "  port {port_name} — {count} LEDs, {} fps, {} bands",
             visualizer.fps(),
@@ -985,9 +988,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_seed_line_is_stable() {
-        assert_eq!(seed_line(42), "seed=42");
-        assert_eq!(seed_line(u64::MAX), "seed=18446744073709551615");
+    fn the_seed_line_covers_live_quiet_and_probe_runs() {
+        assert_eq!(seed_line(42, false, true), Some("seed=42".to_string()));
+        assert_eq!(
+            seed_line(u64::MAX, false, true),
+            Some("seed=18446744073709551615".to_string())
+        );
+        assert_eq!(
+            seed_line(42, true, true),
+            None,
+            "--quiet suppresses the seed line"
+        );
+        assert_eq!(
+            seed_line(42, false, false),
+            None,
+            "probes must not emit a seed line"
+        );
     }
 
     #[test]

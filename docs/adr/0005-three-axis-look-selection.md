@@ -29,13 +29,15 @@ random, and any change crossfades from the colours actually on screen.
 - **Crossfade belongs to the look engine.** `render::compose_bands` renders one
   resolved selection and is pure over motion state. `LookState` owns the last
   displayed frame, the fade snapshot and the wall-clock deadline. On a switch it
-  snapshots the displayed colours, applies the new selection, resets motion
-  events with the current `Dynamics`, and starts a smoothstep fade from the
-  snapshot. A mid-fade switch snapshots the current blend and retargets. At alpha
+  snapshots the displayed colours, applies the new selection, and starts a
+  smoothstep fade from the snapshot. Only a *motion* switch resets motion events
+  with the current `Dynamics`; layout and palette switches leave sparkle and
+  ripple events running. A mid-fade switch snapshots the current blend and
+  retargets. At alpha
   one the snapshot is cleared. `fade_ms = 0` cuts.
 - **Motion events clear, phase continues.** A motion switch clears sparkle,
   ripple and rain state and snapshots the beat counters so a pre-switch beat
-  cannot fire late. The continuous motion clock is never reset by a switch or a
+  cannot fire late. Layout and palette switches do not clear event state. The continuous motion clock is never reset by a switch or a
   fade.
 
 ## Considered Options

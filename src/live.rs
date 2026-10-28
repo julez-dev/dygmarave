@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::Block;
 use crate::dynamics::{Dynamics, DynamicsConfig};
-use crate::look::{LookSettings, LookState};
+use crate::look::{LookSettings, LookState, Switch};
 use crate::render::Pacer;
 use crate::spectrum::{Analyzer, BandPlan, Spectrum};
 use crate::theme::Frame;
@@ -48,6 +48,28 @@ impl Default for LiveConfig {
             channels: 2,
         }
     }
+}
+
+/// Everything needed to construct the live loop, kept together so the
+/// constructor stays a named-argument shape rather than eight positional values.
+#[derive(Debug, Clone)]
+pub struct LiveOptions {
+    pub config: LiveConfig,
+    pub dynamics: DynamicsConfig,
+    pub look: LookSettings,
+    pub seed: u64,
+    pub quiet: bool,
+    pub plan: BandPlan,
+    pub count: usize,
+    pub start: Instant,
+}
+
+/// One line per switch, suppressed by `quiet`.
+fn switch_lines(switches: &[Switch], quiet: bool) -> impl Iterator<Item = String> + '_ {
+    switches
+        .iter()
+        .filter(move |_| !quiet)
+        .map(ToString::to_string)
 }
 
 /// The period of a frame rate, never dividing by zero.
@@ -233,47 +255,35 @@ pub struct Live {
 impl Live {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(config: LiveConfig, plan: BandPlan, count: usize, start: Instant) -> Self {
-        Self::with_dynamics(config, DynamicsConfig::default(), plan, count, start)
-    }
-
-    /// Creates a visualizer with explicit dynamics settings, so the config file's
-    /// render and thumb sections take effect without a rebuild.
-    pub fn with_dynamics(
-        config: LiveConfig,
-        dynamics_config: DynamicsConfig,
-        plan: BandPlan,
-        count: usize,
-        start: Instant,
-    ) -> Self {
-        Self::with_look(
+        Self::with_look(LiveOptions {
             config,
-            dynamics_config,
-            LookSettings::default(),
-            0,
-            false,
+            dynamics: DynamicsConfig::default(),
+            look: LookSettings::default(),
+            seed: 0,
+            quiet: false,
             plan,
             count,
             start,
-        )
+        })
     }
 
     /// Creates a visualizer with the configured look settings, seed and quiet flag.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_look(
-        config: LiveConfig,
-        dynamics_config: DynamicsConfig,
-        look_settings: LookSettings,
-        seed: u64,
-        quiet: bool,
-        plan: BandPlan,
-        count: usize,
-        start: Instant,
-    ) -> Self {
+    pub fn with_look(options: LiveOptions) -> Self {
+        let LiveOptions {
+            config,
+            dynamics,
+            look,
+            seed,
+            quiet,
+            plan,
+            count,
+            start,
+        } = options;
         let bands = plan.band_count();
         Self {
             analyzer: Analyzer::new(plan, config.channels),
-            dynamics: Dynamics::new(dynamics_config, config.channels, bands),
-            look: LookState::new(look_settings, seed, start),
+            dynamics: Dynamics::new(dynamics, config.channels, bands),
+            look: LookState::new(look, seed, start),
             quiet,
             pacer: Pacer::new(period_of(config.fps), start),
             rate: RateControl::new(
@@ -340,10 +350,8 @@ impl Live {
 
         // Timers may fire several axes at once; each gets its own log line.
         let switches = self.look.tick(now, &self.dynamics);
-        if !self.quiet {
-            for switch in &switches {
-                eprintln!("{switch}");
-            }
+        for line in switch_lines(&switches, self.quiet) {
+            eprintln!("{line}");
         }
         let colours = self.look.render(now, &self.dynamics, self.leds);
         Frame::from_colors(&colours)
@@ -603,6 +611,65 @@ mod tests {
     }
 
     #[test]
+    fn switch_logging_emits_one_line_per_switch() {
+        let none: Vec<Switch> = Vec::new();
+        assert_eq!(switch_lines(&none, false).count(), 0);
+
+        let one = [Switch {
+            axis: crate::look::Axis::Layout,
+            from: "snake",
+            to: "rings",
+            reason: crate::look::SwitchReason::Random,
+        }];
+        assert_eq!(
+            switch_lines(&one, false).collect::<Vec<_>>(),
+            vec!["layout snake -> rings (random)".to_string()]
+        );
+
+        let several = [
+            Switch {
+                axis: crate::look::Axis::Layout,
+                from: "snake",
+                to: "rows",
+                reason: crate::look::SwitchReason::Random,
+            },
+            Switch {
+                axis: crate::look::Axis::Palette,
+                from: "ember",
+                to: "ice",
+                reason: crate::look::SwitchReason::Random,
+            },
+            Switch {
+                axis: crate::look::Axis::Motion,
+                from: "none",
+                to: "sweep",
+                reason: crate::look::SwitchReason::Random,
+            },
+        ];
+        assert_eq!(
+            switch_lines(&several, false).collect::<Vec<_>>(),
+            vec![
+                "layout snake -> rows (random)".to_string(),
+                "palette ember -> ice (random)".to_string(),
+                "motion none -> sweep (random)".to_string(),
+            ],
+            "same-tick switches must each get one correctly formatted line"
+        );
+    }
+
+    #[test]
+    fn quiet_suppresses_switch_lines() {
+        let switch = Switch {
+            axis: crate::look::Axis::Layout,
+            from: "snake",
+            to: "rings",
+            reason: crate::look::SwitchReason::Random,
+        };
+        assert_eq!(switch_lines(&[switch], true).count(), 0);
+        assert_eq!(switch_lines(&[switch], false).count(), 1);
+    }
+
+    #[test]
     fn the_look_settings_seed_and_quiet_reach_the_engine() {
         use crate::look::AxisSettings;
         use crate::palette::Palette;
@@ -613,16 +680,16 @@ mod tests {
             ..LookSettings::default()
         };
         let expected = LookState::new(settings.clone(), 87, start).selection();
-        let live = Live::with_look(
-            LiveConfig::default(),
-            DynamicsConfig::default(),
-            settings.clone(),
-            87,
-            true,
-            plan(),
-            132,
+        let live = Live::with_look(LiveOptions {
+            config: LiveConfig::default(),
+            dynamics: DynamicsConfig::default(),
+            look: settings.clone(),
+            seed: 87,
+            quiet: true,
+            plan: plan(),
+            count: 132,
             start,
-        );
+        });
         assert!(live.quiet);
         assert_eq!(live.look.settings(), &settings);
         assert_eq!(live.look.selection(), expected);
